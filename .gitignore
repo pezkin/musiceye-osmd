@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Extracted archives (keep only the zips)
+ASSETS/homr-extracted/
+ASSETS/music-eye-extracted/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local

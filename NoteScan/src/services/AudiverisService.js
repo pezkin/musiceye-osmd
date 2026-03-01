@@ -208,6 +208,57 @@ class AudiverisServiceClass {
   }
 
   /**
+   * Send an image to the /debug endpoint and get back
+   * the preprocessed PNG as a base64 data URI.
+   * This lets the user see exactly what Audiveris receives.
+   */
+  async debugPreprocess(imageUri) {
+    const fileName = imageUri.split('/').pop() || 'sheet_music.jpg';
+    const ext = fileName.split('.').pop().toLowerCase();
+    const mimeType = ext === 'png' ? 'image/png' : 'image/jpeg';
+
+    const formData = new FormData();
+    formData.append('file', {
+      uri: imageUri,
+      name: fileName,
+      type: mimeType,
+    });
+
+    const debugUrl = `${this.getServerUrl()}/audiveris/debug`;
+    console.log(`🔍 Debug preprocess → ${debugUrl}`);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+
+    let response;
+    try {
+      response = await fetch(debugUrl, {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+    } catch (e) {
+      clearTimeout(timeout);
+      throw new Error(`Failed to connect to server: ${e.message}`);
+    }
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`Server error ${response.status}: ${body.substring(0, 200)}`);
+    }
+
+    // Read the PNG response as a blob and convert to base64 data URI
+    const blob = await response.blob();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('Failed to read preprocessed image'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  /**
    * Process an image and return a scoreData object compatible with PlaybackScreen.
    * Returns a scoreData object compatible with PlaybackScreen.
    */

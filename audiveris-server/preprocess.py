@@ -1,14 +1,24 @@
 """
 Advanced image preprocessing for OMR (Optical Music Recognition).
 
-Pipeline for camera photos of sheet music:
+Pipeline for camera photos of sheet music (10 steps):
   Raw camera photo
-    → Perspective correction  (straighten tilted shots)
-    → Deskew                  (align staff lines horizontally)
-    → Resolution normalize    (target 2400px long edge)
-    → Sauvola binarization    (clean black & white, handles uneven lighting)
-    → Noise removal           (connected-component filtering)
+    → Auto-crop             (remove desk/background around page)
+    → Perspective correction (straighten tilted shots)
+    → Dewarp                (flatten curved pages / book spines)
+    → Deskew                (align staff lines horizontally)
+    → Resize                (target 2400px long edge, min 1600 short)
+    → Sharpen               (recover phone-camera blur via unsharp mask)
+    → Smart binarize        (Sauvola first, Adobe-Scan fallback)
+    → Close gaps            (reconnect broken staff lines)
+    → Noise removal         (connected-component filtering)
     → Clean B&W image ready for Audiveris
+
+Inspired by Leptonica's approach (as used by Zemsky's Sheet Music Scanner):
+  - pixSauvolaBinarize  → our _sauvola()
+  - dewarpBuildPageModel → our _dewarp()
+  - pixDeskew            → our _deskew()
+  - fixPerspective       → our _perspective_correct()
 
 Uses OpenCV when available (best quality), falls back to PIL + numpy.
 """
@@ -125,8 +135,13 @@ def _resize_only(src: str, dst: str, target: int) -> str:
 # ──────────────────────────────────────────────────────────
 
 def _cv2_pipeline(src: str, dst: str, target: int) -> str:
-    """Adobe-Scan-style pipeline: aggressive binarization that forces
-    a clean pure-black-on-white result from any camera photo."""
+    """Camera-photo → clean B&W pipeline optimised for music notation.
+
+    Inspired by Leptonica's approach (as used by Zemsky's Sheet Music Scanner):
+    - Sauvola binarization (gold standard for thin lines + uneven lighting)
+    - Sharpening to recover phone-camera blur
+    - Conservative morphology to preserve delicate music symbols
+    """
     img = cv2.imread(src)
     if img is None:
         log(f"Cannot read {src}, returning as-is")
@@ -135,28 +150,35 @@ def _cv2_pipeline(src: str, dst: str, target: int) -> str:
     h, w = img.shape[:2]
     log(f"Input {w}×{h}  mode={'color' if len(img.shape)==3 else 'gray'}")
 
-    # 1. Perspective correction (straighten tilted shots)
+    # 1. Auto-crop — remove non-page border (table, desk, background)
+    img = _auto_crop(img)
+
+    # 2. Perspective correction (straighten tilted shots)
     img = _perspective_correct(img)
 
-    # 2. Grayscale
+    # 3. Grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
 
-    # 3. Dewarp — straighten curved/bent pages (book spines, curled paper)
+    # 4. Dewarp — straighten curved/bent pages (book spines, curled paper)
     gray = _dewarp(gray)
 
-    # 4. Deskew via staff-line angle
+    # 5. Deskew via staff-line angle
     gray = _deskew(gray)
 
-    # 5. Resize to target range
+    # 6. Resize to target range (Audiveris needs interline ≥ 16px)
     gray = _resize(gray, target)
 
-    # 6. Adobe-Scan-style aggressive binarization
-    binary = _adobe_scan_binarize(gray)
+    # 7. Sharpen — phone photos are always slightly soft; unsharp mask
+    #    recovers thin staff lines that would otherwise vanish in binarization
+    gray = _sharpen(gray)
 
-    # 7. Morphological close to reconnect broken staff lines
+    # 8. Binarize — Sauvola first (like Zemsky/Leptonica), Adobe-Scan fallback
+    binary = _smart_binarize(gray)
+
+    # 9. Morphological close to reconnect broken staff lines
     binary = _close_gaps(binary)
 
-    # 8. Remove small noise specks
+    # 10. Remove small noise specks
     binary = _remove_noise(binary)
 
     cv2.imwrite(dst, binary)
@@ -411,6 +433,49 @@ def _pil_pipeline(src: str, dst: str, target: int) -> str:
 #  Shared helpers (OpenCV)
 # ──────────────────────────────────────────────────────────
 
+def _auto_crop(img):
+    """Remove non-page border (table, desk, dark background).
+
+    Uses edge detection + largest-contour bounding rect to find the
+    sheet music page, even without a perfect 4-corner quad.  More
+    lenient than perspective_correct — works on partial page edges.
+    """
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
+
+    # Detect page area using Otsu on the grayscale
+    blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Find the largest bright region (= the page)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return img
+
+    largest = max(contours, key=cv2.contourArea)
+    area_ratio = cv2.contourArea(largest) / (w * h)
+
+    # Only crop if the page fills 20–90% of the frame (if ~100%, no background to remove)
+    if area_ratio < 0.20 or area_ratio > 0.92:
+        return img
+
+    x, y, rw, rh = cv2.boundingRect(largest)
+    # Add small margin (2%)
+    margin_x = int(rw * 0.02)
+    margin_y = int(rh * 0.02)
+    x1 = max(0, x - margin_x)
+    y1 = max(0, y - margin_y)
+    x2 = min(w, x + rw + margin_x)
+    y2 = min(h, y + rh + margin_y)
+
+    if (x2 - x1) < w * 0.5 or (y2 - y1) < h * 0.5:
+        return img  # crop too aggressive, skip
+
+    cropped = img[y1:y2, x1:x2]
+    log(f"Auto-cropped {w}×{h} → {x2-x1}×{y2-y1}  (page fills {area_ratio:.0%})")
+    return cropped
+
+
 def _perspective_correct(img):
     """Detect page quad and warp to a flat rectangle."""
     h, w = img.shape[:2]
@@ -520,6 +585,88 @@ def _resize(gray, target):
         gray = cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
         log(f"Downscaled {w}×{h} → {gray.shape[1]}×{gray.shape[0]}")
     return gray
+
+
+def _sharpen(gray):
+    """Unsharp-mask sharpening to recover phone-camera softness.
+
+    Phone photos are always slightly soft due to small sensor, thin lens,
+    and possible slight motion blur.  Without sharpening, 1-2px staff lines
+    become gray blobs that Sauvola binarization turns into broken dashes.
+
+    Uses a mild unsharp mask:  sharpened = gray + alpha * (gray - blurred)
+    Alpha is adaptive — computed from the image's own blur level.
+    """
+    h, w = gray.shape[:2]
+
+    # Measure blur level via Laplacian variance
+    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if lap_var > 800:
+        # Image is already sharp (scanned document) — skip
+        log(f"Sharpen: skipped (Laplacian variance = {lap_var:.0f}, already sharp)")
+        return gray
+
+    # Adaptive strength: blurrier images get more sharpening
+    if lap_var < 100:
+        alpha = 1.5  # very blurry
+    elif lap_var < 300:
+        alpha = 1.0  # moderately soft
+    else:
+        alpha = 0.5  # mildly soft
+
+    # Gaussian blur radius scales with image size (~1/400 of long edge)
+    sigma = max(w, h) / 400.0
+    sigma = max(1.0, min(sigma, 3.0))
+
+    blurred = cv2.GaussianBlur(gray, (0, 0), sigma)
+    sharpened = cv2.addWeighted(gray, 1.0 + alpha, blurred, -alpha, 0)
+    sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
+
+    log(f"Sharpened: alpha={alpha:.1f}  sigma={sigma:.1f}  (blur score={lap_var:.0f})")
+    return sharpened
+
+
+def _smart_binarize(gray):
+    """Intelligent binarization: Sauvola first (like Zemsky/Leptonica),
+    with Adobe-Scan fallback for difficult lighting conditions.
+
+    Sauvola is the gold standard for document binarization — it preserves
+    thin lines (staff lines, stems) far better than global approaches.
+    But it can struggle with extreme lighting gradients (shadow across page).
+    In that case, fall back to the multi-pass Adobe-Scan approach.
+    """
+    h, w = gray.shape[:2]
+
+    # Try Sauvola first
+    binary = _sauvola(gray, k=0.15)  # k=0.15 slightly less aggressive than default
+
+    # Validate result: check ink coverage
+    total = binary.size
+    black = np.sum(binary < 128)
+    ink_pct = black / total
+
+    if 0.02 <= ink_pct <= 0.35:
+        # Looks reasonable for sheet music (2-35% ink)
+        log(f"Smart binarize: Sauvola succeeded (ink={ink_pct:.1%})")
+        return binary
+
+    # Sauvola failed — too little or too much ink.
+    # The image likely has extreme lighting issues.  Fall back to Adobe-Scan.
+    log(f"Smart binarize: Sauvola ink={ink_pct:.1%} (bad) — trying Adobe-Scan fallback")
+    fallback = _adobe_scan_binarize(gray)
+
+    fb_ink = np.sum(fallback < 128) / total
+    if 0.02 <= fb_ink <= 0.35:
+        log(f"Smart binarize: Adobe-Scan fallback succeeded (ink={fb_ink:.1%})")
+        return fallback
+
+    # Both failed — return whichever has more plausible coverage
+    if abs(ink_pct - 0.10) < abs(fb_ink - 0.10):
+        log(f"Smart binarize: both marginal, keeping Sauvola (ink={ink_pct:.1%})")
+        return binary
+    else:
+        log(f"Smart binarize: both marginal, keeping Adobe-Scan (ink={fb_ink:.1%})")
+        return fallback
 
 
 def _sauvola(gray, win=0, k=0.2, R=128.0):

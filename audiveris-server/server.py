@@ -14,10 +14,14 @@ import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse
 
 from preprocess import preprocess  # our advanced pipeline
+
+# Directory for saving debug preprocessed images
+DEBUG_DIR = "/tmp/audiveris-debug"
+os.makedirs(DEBUG_DIR, exist_ok=True)
 
 # Register HEIC/HEIF support with Pillow
 try:
@@ -74,6 +78,45 @@ def root():
 def docs_redirect():
     """Health check endpoint matching HOMR's /docs pattern."""
     return {"status": "ok", "engine": "audiveris"}
+
+
+@app.post("/debug")
+async def debug_preprocess(file: UploadFile = File(...)):
+    """Preprocess a photo and return the cleaned B&W image (no Audiveris).
+
+    Use this to see exactly what Audiveris receives after preprocessing.
+    Upload a camera photo → get back the preprocessed PNG.
+    """
+    job_id = str(uuid.uuid4())[:8]
+    work_path = os.path.join(WORK_DIR, job_id)
+    os.makedirs(work_path, exist_ok=True)
+
+    try:
+        ext = Path(file.filename or "image.png").suffix or ".png"
+        input_file = os.path.join(work_path, f"input{ext}")
+        content = await file.read()
+        with open(input_file, "wb") as f:
+            f.write(content)
+
+        input_file = _convert_to_png_if_needed(input_file, work_path, job_id)
+        processed_file = preprocess(input_file)
+
+        # Copy to debug dir (persists after cleanup)
+        debug_out = os.path.join(DEBUG_DIR, f"debug_{job_id}.png")
+        shutil.copy2(processed_file, debug_out)
+        print(f"[{job_id}] Debug image saved: {debug_out}")
+
+        # Cleanup work dir before returning
+        shutil.rmtree(work_path, ignore_errors=True)
+
+        return FileResponse(
+            debug_out,
+            media_type="image/png",
+            filename=f"preprocessed_{job_id}.png",
+        )
+    except Exception as e:
+        shutil.rmtree(work_path, ignore_errors=True)
+        raise HTTPException(500, f"Debug preprocessing failed: {e}")
 
 
 def _extract_positions_from_omr(omr_path: str) -> dict:
@@ -263,10 +306,29 @@ async def process_image(file: UploadFile = File(...)):
         # Convert HEIC/HEIF/WEBP to PNG (iPhone camera, etc.)
         input_file = _convert_to_png_if_needed(input_file, work_path, job_id)
 
-        # Preprocess: perspective → deskew → binarisation → noise removal
+        # Preprocess: auto-crop → perspective → dewarp → deskew → sharpen → binarise
         processed_file = preprocess(input_file)
 
-        # Build Audiveris command
+        # Save preprocessed image for debugging (last 5 kept)
+        debug_out = os.path.join(DEBUG_DIR, f"last_{job_id}.png")
+        try:
+            shutil.copy2(processed_file, debug_out)
+            # Cleanup old debug images (keep last 5)
+            debug_files = sorted(glob.glob(os.path.join(DEBUG_DIR, "last_*.png")))
+            for old in debug_files[:-5]:
+                os.remove(old)
+        except Exception:
+            pass
+
+        # Build Audiveris command with quality tuning for camera photos
+        # These options make Audiveris more tolerant of imperfect input:
+        #   - Scale.minInterline: accept narrower staff spacing (phone photos)
+        #   - Sheet.Scale.maxInterline: allow wider spacing too
+        quality_options = [
+            "-option", "org.audiveris.omr.sheet.Scale.minInterline=10",
+            "-option", "org.audiveris.omr.sheet.Scale.maxInterline=30",
+        ]
+
         if AUDIVERIS_BIN:
             cmd = [
                 "xvfb-run", "-a",
@@ -274,6 +336,7 @@ async def process_image(file: UploadFile = File(...)):
                 "-batch",
                 "-export",
                 "-output", out_path,
+                *quality_options,
                 processed_file,
             ]
         else:
@@ -283,6 +346,7 @@ async def process_image(file: UploadFile = File(...)):
                 "-batch",
                 "-export",
                 "-output", out_path,
+                *quality_options,
                 processed_file,
             ]
 

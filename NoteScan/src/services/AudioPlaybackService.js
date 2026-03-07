@@ -390,7 +390,11 @@ export class AudioPlaybackService {
   static _voiceBuffers = null; // { Soprano: Float32Array, Alto: ..., Tenor: ..., Bass: ... }
   static _voiceTimingMap = null;
   static _voiceTotalDuration = 0;
-  static _voiceRenderKey = null; // "presetIdx_tempo" to detect when full re-render is needed
+  static _voiceRenderKey = null; // "presetIdx" to detect instrument changes
+
+  // Cached note event data — avoids re-parsing notes on tempo-only changes
+  static _cachedNotes = null;
+  static _cachedBeatData = null; // { beatMap, beatPositions, rests, getBeats }
 
   /**
    * Pre-render separate audio buffers for each SATB voice.
@@ -404,32 +408,41 @@ export class AudioPlaybackService {
     const secondsPerBeat = 60 / tempo;
     const renderKey = `${this.getActivePresetIndex()}`;
 
-    const getBeats = (n) => n.tiedBeats || n.durationBeats || ({
-      whole: 4, half: 2, quarter: 1, eighth: 0.5, sixteenth: 0.25,
-      '32nd': 0.125, dotted_whole: 6, dotted_half: 3, dotted_quarter: 1.5,
-      dotted_eighth: 0.75, dotted_sixteenth: 0.375, dotted_32nd: 0.1875,
-    })[n.duration] || 1;
+    // Reuse cached note grouping data if notes haven't changed
+    let beatMap, beatPositions, rests, getBeats;
+    if (this._cachedNotes === notes && this._cachedBeatData) {
+      ({ beatMap, beatPositions, rests, getBeats } = this._cachedBeatData);
+    } else {
+      getBeats = (n) => n.tiedBeats || n.durationBeats || ({
+        whole: 4, half: 2, quarter: 1, eighth: 0.5, sixteenth: 0.25,
+        '32nd': 0.125, dotted_whole: 6, dotted_half: 3, dotted_quarter: 1.5,
+        dotted_eighth: 0.75, dotted_sixteenth: 0.375, dotted_32nd: 0.1875,
+      })[n.duration] || 1;
 
-    const hasBeatOffset = notes.some(n => typeof n.beatOffset === 'number' && Number.isFinite(n.beatOffset));
-    if (!hasBeatOffset) {
-      // Fall back to legacy path — can't pre-render without beatOffset
-      this._voiceBuffers = null;
-      this._voiceRenderKey = null;
-      return null;
+      const hasBeatOffset = notes.some(n => typeof n.beatOffset === 'number' && Number.isFinite(n.beatOffset));
+      if (!hasBeatOffset) {
+        this._voiceBuffers = null;
+        this._voiceRenderKey = null;
+        this._cachedNotes = null;
+        this._cachedBeatData = null;
+        return null;
+      }
+
+      const realNotes = notes.filter(n => n.type !== 'rest' && n.midiNote != null);
+      beatMap = new Map();
+      for (const n of realNotes) {
+        const bo = Math.round(n.beatOffset * 1000) / 1000;
+        if (!beatMap.has(bo)) beatMap.set(bo, []);
+        beatMap.get(bo).push(n);
+      }
+      beatPositions = [...beatMap.keys()].sort((a, b) => a - b);
+      rests = notes.filter(n => n.type === 'rest' && typeof n.beatOffset === 'number');
+
+      this._cachedNotes = notes;
+      this._cachedBeatData = { beatMap, beatPositions, rests, getBeats };
     }
 
-    const realNotes = notes.filter(n => n.type !== 'rest' && n.midiNote != null);
-
-    // Group by beatOffset for timing map
-    const beatMap = new Map();
-    for (const n of realNotes) {
-      const bo = Math.round(n.beatOffset * 1000) / 1000;
-      if (!beatMap.has(bo)) beatMap.set(bo, []);
-      beatMap.get(bo).push(n);
-    }
-    const beatPositions = [...beatMap.keys()].sort((a, b) => a - b);
-
-    // Build timing map (shared across all voices)
+    // Build timing map (recalculated — depends on secondsPerBeat)
     const timingMap = [];
     for (const bo of beatPositions) {
       const group = beatMap.get(bo);
@@ -438,9 +451,6 @@ export class AudioPlaybackService {
       const avgY = group.reduce((s, n) => s + (n.y || 0), 0) / group.length;
       timingMap.push({ time, x: avgX, y: avgY, staffIndex: group[0].staffIndex, systemIndex: group[0].systemIndex ?? 0, isRest: false });
     }
-
-    // Add rests for cursor tracking
-    const rests = notes.filter(n => n.type === 'rest' && typeof n.beatOffset === 'number');
     for (const r of rests) {
       const rbo = Math.round(r.beatOffset * 1000) / 1000;
       if (!beatMap.has(rbo)) {
@@ -463,12 +473,9 @@ export class AudioPlaybackService {
     const totalSamples = Math.floor((totalDuration + tailSec) * sampleRate);
     const voices = ['Soprano', 'Alto', 'Tenor', 'Bass'];
     const buffers = {};
+    for (const v of voices) buffers[v] = new Float32Array(totalSamples);
 
-    for (const v of voices) {
-      buffers[v] = new Float32Array(totalSamples);
-    }
-
-    // Render each note into its voice buffer
+    // Render each note into its voice buffer (fast: waveform cache handles synthesis)
     for (const bo of beatPositions) {
       const group = beatMap.get(bo);
       const offsetSamples = Math.floor(bo * secondsPerBeat * sampleRate);
@@ -489,13 +496,7 @@ export class AudioPlaybackService {
     this._voiceRenderKey = renderKey;
     this._renderTempo = tempo;
 
-    const counts = voices.map(v => {
-      let peak = 0;
-      for (let i = 0; i < buffers[v].length; i++) peak = Math.max(peak, Math.abs(buffers[v][i]));
-      return `${v[0]}:${peak > 0 ? 'yes' : 'empty'}`;
-    }).join(', ');
-    console.log(`🎹 Pre-rendered 4 voice tracks (${(totalDuration).toFixed(1)}s, ${totalSamples} samples): ${counts}`);
-
+    console.log(`🎹 Pre-rendered 4 voice tracks (${(totalDuration).toFixed(1)}s, ${totalSamples} samples)`);
     return { timingMap, totalDuration };
   }
 
@@ -511,31 +512,64 @@ export class AudioPlaybackService {
       throw new Error('Voice tracks not pre-rendered');
     }
 
+    const sampleRate = 44100;
     const totalSamples = this._voiceBuffers.Soprano.length;
-    const master = new Float32Array(totalSamples);
     const activeVoices = [];
-
     for (const [voice, active] of Object.entries(voiceSelection)) {
-      if (active && this._voiceBuffers[voice]) {
-        const buf = this._voiceBuffers[voice];
-        for (let i = 0; i < totalSamples; i++) master[i] += buf[i];
-        activeVoices.push(voice);
-      }
+      if (active && this._voiceBuffers[voice]) activeVoices.push(voice);
     }
 
-    // Normalize
+    // Pass 1: mix active voices + find peak in one loop
+    const master = new Float32Array(totalSamples);
     let peak = 0;
-    for (let i = 0; i < master.length; i++) {
-      if (!Number.isFinite(master[i])) master[i] = 0;
-      peak = Math.max(peak, Math.abs(master[i]));
+    for (let i = 0; i < totalSamples; i++) {
+      let sum = 0;
+      for (const v of activeVoices) sum += this._voiceBuffers[v][i];
+      if (!Number.isFinite(sum)) sum = 0;
+      master[i] = sum;
+      const abs = sum < 0 ? -sum : sum;
+      if (abs > peak) peak = abs;
     }
-    if (peak > 1) for (let i = 0; i < master.length; i++) master[i] /= peak;
 
-    const fileUri = await this.writeWavToFile(master);
-    console.log(`🎹 Mixed ${activeVoices.join('+')} → WAV`);
+    // Pass 2: normalize + encode to WAV PCM in one loop (Int16Array for speed)
+    const scale = peak > 1 ? 1 / peak : 1;
+    const bytesPerSample = 2;
+    const subChunk2Size = totalSamples * bytesPerSample;
+    const totalBytes = 44 + subChunk2Size;
+    const wavBuffer = new ArrayBuffer(totalBytes);
+    const view = new DataView(wavBuffer);
 
+    // WAV header
+    const ws = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+    ws(0, 'RIFF');
+    view.setUint32(4, 36 + subChunk2Size, true);
+    ws(8, 'WAVE');
+    ws(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * bytesPerSample, true);
+    view.setUint16(32, bytesPerSample, true);
+    view.setUint16(34, 16, true);
+    ws(36, 'data');
+    view.setUint32(40, subChunk2Size, true);
+
+    // Encode PCM: normalize + write in one pass via Int16Array
+    const pcm = new Int16Array(wavBuffer, 44, totalSamples);
+    for (let i = 0; i < totalSamples; i++) {
+      const s = master[i] * scale;
+      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+
+    // Write to reusable temp file
+    const bytes = new Uint8Array(wavBuffer);
+    const file = new File(Paths.cache, 'notescan_playback.wav');
+    try { file.write(bytes); } catch (err) { console.error('❌ WAV write error:', err); throw err; }
+
+    console.log(`🎹 Mixed ${activeVoices.join('+')} → WAV (${(totalBytes / 1024).toFixed(0)} KB)`);
     return {
-      fileUri,
+      fileUri: file.uri,
       timingMap: this._voiceTimingMap,
       totalDuration: this._voiceTotalDuration,
     };

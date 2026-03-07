@@ -428,10 +428,23 @@ async def process_image(file: UploadFile = File(...)):
 
         # Encode preprocessed image as base64 to return to client
         processed_b64 = None
+        preproc_width = 0
+        preproc_height = 0
         try:
             with open(processed_file, "rb") as pf:
-                processed_b64 = base64.b64encode(pf.read()).decode("ascii")
-            print(f"[{job_id}] Preprocessed image: {len(processed_b64)} chars base64")
+                raw_bytes = pf.read()
+                processed_b64 = base64.b64encode(raw_bytes).decode("ascii")
+            # Read actual preprocessed image dimensions
+            from PIL import Image as PILImage
+            with PILImage.open(processed_file) as pimg:
+                preproc_width, preproc_height = pimg.size
+            omr_w = note_positions.get("imageWidth", 0) if note_positions else 0
+            omr_h = note_positions.get("imageHeight", 0) if note_positions else 0
+            print(f"[{job_id}] Preprocessed image: {preproc_width}×{preproc_height}, .omr reports: {omr_w}×{omr_h}, base64: {len(processed_b64)} chars")
+            if omr_w and abs(omr_w - preproc_width) > 2:
+                print(f"[{job_id}] ⚠️ WIDTH MISMATCH: preprocessed={preproc_width} vs .omr={omr_w}")
+            if omr_h and abs(omr_h - preproc_height) > 2:
+                print(f"[{job_id}] ⚠️ HEIGHT MISMATCH: preprocessed={preproc_height} vs .omr={omr_h}")
         except Exception as e:
             print(f"[{job_id}] ⚠️ Could not encode preprocessed image: {e}")
 
@@ -440,6 +453,8 @@ async def process_image(file: UploadFile = File(...)):
             "musicxml": musicxml_content,
             "notePositions": note_positions,
             "processedImage": processed_b64,
+            "preprocWidth": preproc_width,
+            "preprocHeight": preproc_height,
         })
 
     except subprocess.TimeoutExpired:

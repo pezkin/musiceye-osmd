@@ -286,33 +286,65 @@ class AudiverisServiceClass {
   async processSheet(imageUri, onProgress) {
     const { notes, metadata, notePositions, processedImageUri } = await this.processImage(imageUri, onProgress);
 
-    // When we have a preprocessed image + real .omr positions, use the .omr
-    // image dimensions directly (the preprocessed image IS what Audiveris saw).
-    // Otherwise fall back to measuring the original camera photo.
+    // Determine displayed image dimensions and whether we have real .omr positions.
     const hasRealPositions = notePositions && notePositions.heads && notePositions.heads.length > 0
       && notePositions.systems && notePositions.systems.length > 0;
 
     let imageWidth = 1400;
     let imageHeight = 1000;
 
-    if (hasRealPositions && processedImageUri) {
-      // Use .omr dimensions — they match the preprocessed image exactly
-      imageWidth = notePositions.imageWidth || 1400;
-      imageHeight = notePositions.imageHeight || 1000;
-      console.log(`📐 Using .omr image dimensions: ${imageWidth}×${imageHeight}`);
-    } else {
-      // Fallback: measure the original camera photo
-      try {
-        const { Image } = require('react-native');
-        await new Promise((resolve) => {
-          Image.getSize(
-            imageUri,
-            (w, h) => { imageWidth = w; imageHeight = h; resolve(); },
-            () => resolve()
-          );
-        });
-      } catch (e) {
-        console.warn('Could not get image dimensions:', e.message);
+    // Always measure the ACTUAL image the viewer will display.
+    // This is the preprocessed image if available, otherwise the original photo.
+    const displayUri = processedImageUri || imageUri;
+    try {
+      const { Image } = require('react-native');
+      const dims = await new Promise((resolve) => {
+        Image.getSize(
+          displayUri,
+          (w, h) => resolve({ w, h }),
+          () => resolve(null)
+        );
+      });
+      if (dims) {
+        imageWidth = dims.w;
+        imageHeight = dims.h;
+      }
+    } catch (e) {
+      console.warn('Could not get image dimensions:', e.message);
+    }
+
+    // If .omr dimensions differ from the actual image, pre-scale all .omr data
+    // to match. This handles any Audiveris internal rescaling.
+    if (hasRealPositions) {
+      const omrW = notePositions.imageWidth || 0;
+      const omrH = notePositions.imageHeight || 0;
+      console.log(`📐 Display image: ${imageWidth}×${imageHeight}, .omr reports: ${omrW}×${omrH}`);
+
+      if (omrW > 0 && omrH > 0 && (Math.abs(omrW - imageWidth) > 2 || Math.abs(omrH - imageHeight) > 2)) {
+        const sx = imageWidth / omrW;
+        const sy = imageHeight / omrH;
+        console.warn(`⚠️ Dimension mismatch — rescaling .omr coords by ${sx.toFixed(3)}×${sy.toFixed(3)}`);
+        for (const head of notePositions.heads) {
+          head.x = Math.round(head.x * sx);
+          head.y = Math.round(head.y * sy);
+          head.w = Math.round(head.w * sx);
+          head.h = Math.round(head.h * sy);
+        }
+        for (const sys of notePositions.systems) {
+          sys.top *= sy; sys.bottom *= sy;
+          sys.left *= sx; sys.right *= sx;
+          if (sys.measures) {
+            for (const m of sys.measures) { m.left *= sx; m.right *= sx; }
+          }
+          if (sys.staffs) {
+            for (const s of sys.staffs) {
+              s.top *= sy; s.bottom *= sy;
+              s.left = (s.left || 0) * sx; s.right = (s.right || 0) * sx;
+            }
+          }
+        }
+        notePositions.imageWidth = imageWidth;
+        notePositions.imageHeight = imageHeight;
       }
     }
 
@@ -325,7 +357,6 @@ class AudiverisServiceClass {
       // ── Build measure → system mapping and measure x-ranges from .omr ──
       const measureToSystem = {};   // measureNum → systemIndex
       const measureRanges = {};     // measureNum → { left, right }
-      const omrImgW = notePositions.imageWidth || 1;
 
       for (const sys of notePositions.systems) {
         for (const m of sys.measures) {
@@ -356,6 +387,9 @@ class AudiverisServiceClass {
         notesByMeasure[mNum].push(note);
       }
 
+      let matchedDirect = 0;
+      let matchedInterp = 0;
+
       for (const [mNumStr, mNotes] of Object.entries(notesByMeasure)) {
         const mNum = parseInt(mNumStr);
         const sysIdx = measureToSystem[mNum] ?? 0;
@@ -375,14 +409,15 @@ class AudiverisServiceClass {
           // Match notes to heads by sequential order within the measure
           // Handle chords: multiple notes at same beat share similar x
           const uniqueBeats = [...new Set(nonRests.map(n => n.beatOffset))].sort((a, b) => a - b);
-          const uniqueXClusters = _clusterByX(heads, (omrImgW || 1) * 0.02);
+          const uniqueXClusters = _clusterByX(heads, imageWidth * 0.02);
 
           if (uniqueBeats.length === uniqueXClusters.length) {
             // Perfect 1:1 beat→cluster match — use .omr head positions directly
+            matchedDirect += nonRests.length;
             for (let bi = 0; bi < uniqueBeats.length; bi++) {
               const beatNotes = nonRests.filter(n => n.beatOffset === uniqueBeats[bi]);
               const cluster = uniqueXClusters[bi];
-              // Use absolute .omr pixel coordinates directly (no ratio mapping)
+              // Use absolute pixel coordinates directly (already scaled to display image)
               const clusterCenterX = cluster.reduce((s, h) => s + h.x + h.w / 2, 0) / cluster.length;
 
               for (const note of beatNotes) {
@@ -398,19 +433,23 @@ class AudiverisServiceClass {
             }
           } else {
             // Fallback: distribute using measure x-range + beatOffset interpolation
-            _assignXByBeatInterpolation(nonRests, range, notePositions.systems[sysIdx], omrImgW, imageWidth);
+            matchedInterp += nonRests.length;
+            _assignXByBeatInterpolation(nonRests, range);
           }
 
           // Assign rest positions using beatOffset interpolation within measure range
           const rests = mNotes.filter(n => n.type === 'rest');
           if (rests.length > 0 && range) {
-            _assignXByBeatInterpolation(rests, range, notePositions.systems[sysIdx], omrImgW, imageWidth);
+            _assignXByBeatInterpolation(rests, range);
           }
         } else if (range) {
           // No heads matched — use measure-range interpolation (still better than global)
-          _assignXByBeatInterpolation(mNotes, range, notePositions.systems[sysIdx], omrImgW, imageWidth);
+          matchedInterp += mNotes.filter(n => n.type !== 'rest').length;
+          _assignXByBeatInterpolation(mNotes, range);
         }
       }
+
+      console.log(`📊 Position matching: ${matchedDirect} notes from .omr heads, ${matchedInterp} notes interpolated`);
 
       // ── Assign y positions using real .omr data ──
       for (const note of notes) {
@@ -568,8 +607,8 @@ function _clusterByX(heads, threshold) {
 /**
  * Assign x positions to notes using measure x-range + beatOffset interpolation.
  */
-function _assignXByBeatInterpolation(notesInMeasure, measureRange, systemData, omrImgW, imageWidth) {
-  if (!measureRange || !systemData) return;
+function _assignXByBeatInterpolation(notesInMeasure, measureRange) {
+  if (!measureRange) return;
 
   const beats = notesInMeasure
     .map(n => n.beatOffset)
@@ -578,8 +617,10 @@ function _assignXByBeatInterpolation(notesInMeasure, measureRange, systemData, o
   const maxBeat = beats.length > 0 ? Math.max(...beats) : 1;
   const beatRange = maxBeat - minBeat || 1;
 
-  const mLeft = measureRange.left / omrImgW * imageWidth;
-  const mRight = measureRange.right / omrImgW * imageWidth;
+  // measureRange.left/right are already in display-image pixel coordinates
+  // (pre-scaled if .omr dims differed from actual image)
+  const mLeft = measureRange.left;
+  const mRight = measureRange.right;
   const mWidth = mRight - mLeft;
   const margin = mWidth * 0.1; // Small margin within measure
 

@@ -139,7 +139,9 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
     });
   }, [processScore]);
 
-  /* ── Phase 1: Pre-render voice tracks when scoreData, instrument, or tempo changes ── */
+  /* ── Phase 1: Pre-render voice tracks when scoreData or instrument changes ── */
+  /* Audio is always rendered at the current tempo. Tempo changes are handled    */
+  /* separately via reRenderForTempo() called on slider release / preset tap.    */
   useEffect(() => {
     if (!scoreData) return;
     let cancelled = false;
@@ -148,9 +150,8 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
 
     const doPreRender = async () => {
       const myId = ++prepareIdRef.current;
-      const wasPlaying = AudioPlaybackService.isPlaying;
 
-      // Stop current playback before re-rendering
+      // Stop current playback
       if (AudioPlaybackService.sound) {
         try {
           await AudioPlaybackService.sound.stopAsync();
@@ -159,6 +160,8 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
         AudioPlaybackService.sound = null;
       }
       AudioPlaybackService.isPlaying = false;
+      setIsPlaying(false);
+      setIsPaused(false);
 
       setPreparing(true);
       try {
@@ -172,18 +175,6 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
 
         if (result) {
           await doMix(myId);
-
-          // Auto-restart if was playing
-          if (wasPlaying && myId === prepareIdRef.current && audioFileUriRef.current) {
-            setIsPlaying(true);
-            setIsPaused(false);
-            setPlaybackTime(0);
-            await AudioPlaybackService.play(
-              audioFileUriRef.current,
-              (timeSec) => setPlaybackTime(timeSec),
-              () => { setIsPlaying(false); setIsPaused(false); }
-            );
-          }
         } else {
           await legacyPrepare(myId);
         }
@@ -201,7 +192,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
     return () => {
       cancelled = true;
     };
-  }, [scoreData, selectedPresetIndex, tempo]);
+  }, [scoreData, selectedPresetIndex]);
 
   /* ── Phase 2: Quick mix when voice selection changes (no re-render needed) ── */
   useEffect(() => {
@@ -273,6 +264,47 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
       if (myId === prepareIdRef.current) {
         setPreparing(false);
       }
+    }
+  };
+
+  /**
+   * Re-render audio at a new tempo. Called when user releases the tempo
+   * slider or taps a preset button. Stops current playback, re-synthesizes,
+   * re-mixes, and leaves audio ready for the next Play press.
+   */
+  const reRenderForTempo = async (newTempo) => {
+    if (!scoreData) return;
+    if (newTempo === renderTempoRef.current) return;
+
+    const myId = ++prepareIdRef.current;
+
+    // Stop current playback
+    if (AudioPlaybackService.sound) {
+      try {
+        await AudioPlaybackService.sound.stopAsync();
+        await AudioPlaybackService.sound.unloadAsync();
+      } catch (_) {}
+      AudioPlaybackService.sound = null;
+    }
+    AudioPlaybackService.isPlaying = false;
+    setIsPlaying(false);
+    setIsPaused(false);
+
+    setPreparing(true);
+    try {
+      renderTempoRef.current = newTempo;
+      const result = await AudioPlaybackService.preRenderVoiceTracks(scoreData.notes, newTempo);
+      if (myId !== prepareIdRef.current) return;
+      if (!result) {
+        // Legacy path
+        await legacyPrepare(myId);
+        return;
+      }
+      await doMix(myId);
+      console.log(`✅ Tempo re-render: ${newTempo} BPM`);
+    } catch (e) {
+      console.warn('Tempo re-render error:', e);
+      if (myId === prepareIdRef.current) setPreparing(false);
     }
   };
 
@@ -581,6 +613,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
               const bpm = Math.round(v);
               setSliderTempo(bpm);
               setTempo(bpm);
+              reRenderForTempo(bpm);
             }}
             minimumTrackTintColor={barPalette.accent}
             maximumTrackTintColor={barPalette.barBorder}
@@ -601,7 +634,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
                   styles.tempoPresetBtn,
                   Math.abs(tempo - p.bpm) < 10 && styles.tempoPresetBtnActive,
                 ]}
-                onPress={() => { setSliderTempo(p.bpm); setTempo(p.bpm); }}
+                onPress={() => { setSliderTempo(p.bpm); setTempo(p.bpm); reRenderForTempo(p.bpm); }}
               >
                 <Text
                   style={[

@@ -1,21 +1,36 @@
 import { Audio } from 'expo-av';
 import { File, Paths } from 'expo-file-system/next';
+import { AudioContext } from 'react-native-audio-api';
 import { SoundFontService } from './SoundFontService';
 
 /**
  * Piano audio synthesis and playback engine.
- * Uses SoundFont (.sf2) samples when available for high-quality output.
- * Falls back to waveform synthesis if the SoundFont is not yet loaded.
- * Generates a single combined WAV written to a temp file (not a data URL).
- * Cursor tracking is driven by onPlaybackStatusUpdate — no manual timers.
+ * Uses react-native-audio-api (Web Audio API) for instant playback.
+ * Notes are scheduled as individual AudioBufferSourceNodes —
+ * tempo changes just reschedule events, no re-synthesis needed.
+ * Falls back to expo-av WAV-file path only when Web Audio is unavailable.
  */
 export class AudioPlaybackService {
-  static sound = null;
+  static sound = null;  // expo-av legacy
   static isPlaying = false;
   static _tempFileUri = null;
   static _soundFontReady = false;
   static _renderTempo = 120;
   static _noteWaveformCache = new Map();
+
+  /* ─── Web Audio API engine ─── */
+  static _audioCtx = null;
+  static _scheduledSources = [];   // active AudioBufferSourceNode[]
+  static _audioBufferCache = new Map(); // cacheKey → AudioBuffer
+  static _noteEvents = null;       // [{ midiNote, velocity, beatOffset, durationBeats, voice }]
+  static _timingBeatData = null;   // [{ beatOffset, x, y, staffIndex, systemIndex, isRest }]
+  static _totalBeats = 0;
+  static _playStartTime = 0;       // audioCtx.currentTime when play began
+  static _playStartOffset = 0;     // seek offset in seconds
+  static _positionTimer = null;
+  static _onPositionUpdate = null;
+  static _onFinished = null;
+  static _currentTempo = 120;
 
   /* ─── SoundFont loading ─── */
 
@@ -62,6 +77,7 @@ export class AudioPlaybackService {
     if (!this._soundFontReady) return;
     SoundFontService.selectPreset(index);
     this._noteWaveformCache.clear();
+    this._audioBufferCache.clear();
   }
 
   /* ─── Frequency helpers ─── */
@@ -173,6 +189,239 @@ export class AudioPlaybackService {
       audioData[i] = sample * envelope * velocityFactor * 0.75;
     }
     return audioData;
+  }
+
+  /* ─── Web Audio API engine ─── */
+
+  /** Lazily create / return the shared AudioContext. */
+  static _getAudioContext() {
+    if (!this._audioCtx || this._audioCtx.state === 'closed') {
+      this._audioCtx = new AudioContext();
+    }
+    return this._audioCtx;
+  }
+
+  /** Convert a Float32Array waveform → AudioBuffer (cached). */
+  static _getAudioBuffer(midiNote, durationSec, velocity = 100) {
+    const cacheKey = `${midiNote}_${velocity}_${Math.round(durationSec * 1000)}`;
+    if (this._audioBufferCache.has(cacheKey)) return this._audioBufferCache.get(cacheKey);
+
+    const samples = this.generatePianoNote(midiNote, durationSec, velocity);
+    const ctx = this._getAudioContext();
+    const buf = ctx.createBuffer(1, samples.length, 44100);
+    const channel = buf.getChannelData(0);
+    channel.set(samples);
+    this._audioBufferCache.set(cacheKey, buf);
+    return buf;
+  }
+
+  /**
+   * Prepare note events from scoreData (parse once, reuse across tempos).
+   * Returns { noteEvents, timingBeatData, totalBeats }.
+   */
+  static prepareNoteEvents(notes) {
+    const getBeats = (n) => n.tiedBeats || n.durationBeats || ({
+      whole: 4, half: 2, quarter: 1, eighth: 0.5, sixteenth: 0.25,
+      '32nd': 0.125, dotted_whole: 6, dotted_half: 3, dotted_quarter: 1.5,
+      dotted_eighth: 0.75, dotted_sixteenth: 0.375, dotted_32nd: 0.1875,
+    })[n.duration] || 1;
+
+    const hasBeatOffset = notes.some(n => typeof n.beatOffset === 'number' && Number.isFinite(n.beatOffset));
+    if (!hasBeatOffset) return null;
+
+    const realNotes = notes.filter(n => n.type !== 'rest' && n.midiNote != null);
+    const noteEvents = realNotes.map(n => ({
+      midiNote: n.midiNote,
+      velocity: 100,
+      beatOffset: Math.round(n.beatOffset * 1000) / 1000,
+      durationBeats: getBeats(n),
+      voice: n.voice || 'Soprano',
+      x: n.x || 0,
+      y: n.y || 0,
+      staffIndex: n.staffIndex,
+      systemIndex: n.systemIndex ?? 0,
+    }));
+
+    // Build beat-based timing map (beat positions → coordinates)
+    const beatMap = new Map();
+    for (const e of noteEvents) {
+      if (!beatMap.has(e.beatOffset)) beatMap.set(e.beatOffset, []);
+      beatMap.get(e.beatOffset).push(e);
+    }
+    const beatPositions = [...beatMap.keys()].sort((a, b) => a - b);
+
+    const timingBeatData = [];
+    for (const bo of beatPositions) {
+      const group = beatMap.get(bo);
+      const avgX = group.reduce((s, n) => s + n.x, 0) / group.length;
+      const avgY = group.reduce((s, n) => s + n.y, 0) / group.length;
+      timingBeatData.push({
+        beatOffset: bo,
+        x: avgX,
+        y: avgY,
+        staffIndex: group[0].staffIndex,
+        systemIndex: group[0].systemIndex,
+        isRest: false,
+      });
+    }
+
+    // Add rests
+    const rests = notes.filter(n => n.type === 'rest' && typeof n.beatOffset === 'number');
+    for (const r of rests) {
+      const rbo = Math.round(r.beatOffset * 1000) / 1000;
+      if (!beatMap.has(rbo)) {
+        timingBeatData.push({
+          beatOffset: rbo,
+          x: r.x || 0,
+          y: r.y || 0,
+          staffIndex: r.staffIndex,
+          systemIndex: r.systemIndex ?? 0,
+          isRest: true,
+        });
+      }
+    }
+    timingBeatData.sort((a, b) => a.beatOffset - b.beatOffset);
+
+    // Total beats
+    let totalBeats = 0;
+    if (beatPositions.length > 0) {
+      const lastBo = beatPositions[beatPositions.length - 1];
+      const lastGroup = beatMap.get(lastBo);
+      const maxDur = Math.max(...lastGroup.map(e => e.durationBeats));
+      totalBeats = lastBo + maxDur;
+    }
+
+    this._noteEvents = noteEvents;
+    this._timingBeatData = timingBeatData;
+    this._totalBeats = totalBeats;
+
+    console.log(`🎵 Prepared ${noteEvents.length} note events, ${totalBeats.toFixed(1)} total beats`);
+    return { noteEvents, timingBeatData, totalBeats };
+  }
+
+  /**
+   * Build the timing map for a given tempo (pure arithmetic, instant).
+   */
+  static buildTimingMap(tempo) {
+    if (!this._timingBeatData) return [];
+    const spb = 60 / tempo;
+    return this._timingBeatData.map(t => ({
+      time: t.beatOffset * spb,
+      x: t.x,
+      y: t.y,
+      staffIndex: t.staffIndex,
+      systemIndex: t.systemIndex,
+      isRest: t.isRest,
+    }));
+  }
+
+  /**
+   * Schedule all note events via Web Audio API for given tempo + voice selection.
+   * This is near-instant: just creates AudioBufferSourceNodes with start times.
+   */
+  static schedulePlayback(tempo, voiceSelection, startOffsetSec = 0) {
+    this._stopScheduled();
+
+    const ctx = this._getAudioContext();
+    if (ctx.state === 'suspended') ctx.resume();
+
+    const spb = 60 / tempo;
+    const totalDuration = this._totalBeats * spb;
+    const now = ctx.currentTime + 0.05; // tiny lookahead for scheduling precision
+    const sources = [];
+
+    for (const evt of this._noteEvents) {
+      if (!voiceSelection[evt.voice]) continue;
+
+      const noteTime = evt.beatOffset * spb;
+      if (noteTime < startOffsetSec) continue; // skip past notes when seeking
+
+      const durSec = evt.durationBeats * spb;
+      const audioBuf = this._getAudioBuffer(evt.midiNote, durSec, evt.velocity);
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuf;
+      source.connect(ctx.destination);
+      source.start(now + noteTime - startOffsetSec);
+      sources.push(source);
+    }
+
+    this._scheduledSources = sources;
+    this._playStartTime = now;
+    this._playStartOffset = startOffsetSec;
+    this._currentTempo = tempo;
+    this.isPlaying = true;
+    this._renderTempo = tempo;
+
+    // Position tracking timer (~60 fps)
+    this._startPositionTracking(totalDuration - startOffsetSec);
+
+    console.log(`▶️ Scheduled ${sources.length} notes at ${tempo} BPM via Web Audio`);
+    return { totalDuration };
+  }
+
+  /** Stop all scheduled Web Audio sources. */
+  static _stopScheduled() {
+    for (const src of this._scheduledSources) {
+      try { src.stop(); } catch (_) {}
+    }
+    this._scheduledSources = [];
+    this._stopPositionTracking();
+  }
+
+  /** Start a 60fps position tracking timer. */
+  static _startPositionTracking(remainingDuration) {
+    this._stopPositionTracking();
+    const ctx = this._getAudioContext();
+    const start = this._playStartTime;
+    const offset = this._playStartOffset;
+
+    this._positionTimer = setInterval(() => {
+      if (!this.isPlaying) {
+        this._stopPositionTracking();
+        return;
+      }
+      const elapsed = ctx.currentTime - start + offset;
+      if (this._onPositionUpdate) this._onPositionUpdate(elapsed);
+
+      if (elapsed >= this._totalBeats * (60 / this._currentTempo)) {
+        this.isPlaying = false;
+        this._stopPositionTracking();
+        this._stopScheduled();
+        if (this._onFinished) this._onFinished();
+      }
+    }, 16);
+  }
+
+  /** Stop position tracking timer. */
+  static _stopPositionTracking() {
+    if (this._positionTimer) {
+      clearInterval(this._positionTimer);
+      this._positionTimer = null;
+    }
+  }
+
+  /**
+   * Instantly change tempo during playback (or before play).
+   * Reschedules all notes with new timing — no re-synthesis.
+   */
+  static changeTempo(newTempo, voiceSelection) {
+    if (!this._noteEvents) return null;
+
+    const timingMap = this.buildTimingMap(newTempo);
+    const totalDuration = this._totalBeats * (60 / newTempo);
+
+    if (this.isPlaying) {
+      // Calculate current position, reschedule from there
+      const ctx = this._getAudioContext();
+      const elapsed = ctx.currentTime - this._playStartTime + this._playStartOffset;
+      this.schedulePlayback(newTempo, voiceSelection, elapsed);
+    }
+
+    this._currentTempo = newTempo;
+    this._renderTempo = newTempo;
+
+    return { timingMap, totalDuration };
   }
 
   /* ─── WAV encoding ─── */
@@ -717,6 +966,8 @@ export class AudioPlaybackService {
 
   /* ─── Playback control ─── */
 
+  static _useWebAudio = false; // true when note events are prepared
+
   static async initAudio() {
     try {
       await Audio.setAudioModeAsync({
@@ -730,7 +981,19 @@ export class AudioPlaybackService {
   }
 
   /**
-   * Play combined audio. Calls `onPositionUpdate(timeSec)` ~60×/sec.
+   * Play using Web Audio API (event-based, instant tempo changes).
+   * Called when note events are prepared.
+   */
+  static playWebAudio(tempo, voiceSelection, onPositionUpdate, onFinished) {
+    this._onPositionUpdate = onPositionUpdate;
+    this._onFinished = onFinished;
+    this.schedulePlayback(tempo, voiceSelection, 0);
+    return { totalDuration: this._totalBeats * (60 / tempo) };
+  }
+
+  /**
+   * Play combined audio via expo-av (legacy fallback).
+   * Calls `onPositionUpdate(timeSec)` ~60×/sec.
    * Calls `onFinished()` when playback completes.
    */
   static async play(fileUri, onPositionUpdate, onFinished) {
@@ -742,6 +1005,7 @@ export class AudioPlaybackService {
       return;
     }
 
+    this._useWebAudio = false;
     this._tempFileUri = fileUri;
     console.log(`▶️ play(): loading ${fileUri}`);
 
@@ -750,8 +1014,6 @@ export class AudioPlaybackService {
         { uri: fileUri },
         { shouldPlay: true, progressUpdateIntervalMillis: 16 }
       );
-
-      console.log(`▶️ play(): sound created, duration=${initialStatus.durationMillis}ms, isPlaying=${initialStatus.isPlaying}`);
 
       if (!initialStatus.isLoaded) {
         console.error('▶️ play(): sound not loaded after createAsync');
@@ -764,11 +1026,9 @@ export class AudioPlaybackService {
 
       sound.setOnPlaybackStatusUpdate((status) => {
         if (!status.isLoaded) return;
-
         if (status.isPlaying && status.positionMillis != null) {
           if (onPositionUpdate) onPositionUpdate(status.positionMillis / 1000);
         }
-
         if (status.didJustFinish) {
           this.isPlaying = false;
           if (onFinished) onFinished();
@@ -781,24 +1041,37 @@ export class AudioPlaybackService {
     }
   }
 
-  /** Return the tempo used when audio was last rendered. */
+  /** Return the tempo used when audio was last rendered / scheduled. */
   static getRenderTempo() {
     return this._renderTempo;
   }
 
   static async pause() {
+    if (this._useWebAudio) {
+      this._stopScheduled();
+      // Remember position for resume
+      if (this._audioCtx) {
+        this._playStartOffset = this._audioCtx.currentTime - this._playStartTime + this._playStartOffset;
+      }
+      this.isPlaying = false;
+      return;
+    }
     if (this.sound) {
       try {
         const status = await this.sound.getStatusAsync();
         if (status.isLoaded && status.isPlaying) await this.sound.pauseAsync();
-      } catch (e) {
-        /* ignore */
-      }
+      } catch (e) { /* ignore */ }
     }
     this.isPlaying = false;
   }
 
-  static async resume() {
+  static async resume(voiceSelection) {
+    if (this._useWebAudio) {
+      if (this._noteEvents && voiceSelection) {
+        this.schedulePlayback(this._currentTempo, voiceSelection, this._playStartOffset);
+      }
+      return;
+    }
     if (this.sound) {
       try {
         const status = await this.sound.getStatusAsync();
@@ -806,36 +1079,40 @@ export class AudioPlaybackService {
           await this.sound.playAsync();
           this.isPlaying = true;
         }
-      } catch (e) {
-        /* ignore */
-      }
+      } catch (e) { /* ignore */ }
     }
   }
 
   static async stop() {
+    // Web Audio path
+    this._stopScheduled();
+    this._playStartOffset = 0;
+
+    // expo-av path
     if (this.sound) {
       try {
         await this.sound.stopAsync();
         await this.sound.unloadAsync();
-      } catch (e) {
-        /* already unloaded */
-      }
+      } catch (e) { /* already unloaded */ }
       this.sound = null;
     }
-    // NOTE: Do NOT delete the temp file here — PlaybackScreen may
-    // still reference it (e.g. pressing Play again after finish).
-    // Temp files are cleaned up when a new WAV is generated (overwrite)
-    // or when the screen unmounts.
     this.isPlaying = false;
   }
 
-  static async seekTo(timeSeconds) {
+  static async seekTo(timeSeconds, voiceSelection) {
+    if (this._useWebAudio && voiceSelection) {
+      const wasPlaying = this.isPlaying;
+      this._stopScheduled();
+      this._playStartOffset = timeSeconds;
+      if (wasPlaying) {
+        this.schedulePlayback(this._currentTempo, voiceSelection, timeSeconds);
+      }
+      return;
+    }
     if (this.sound) {
       try {
         await this.sound.setPositionAsync(Math.floor(timeSeconds * 1000));
-      } catch (e) {
-        /* ignore */
-      }
+      } catch (e) { /* ignore */ }
     }
   }
 }

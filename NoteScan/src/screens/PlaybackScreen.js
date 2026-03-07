@@ -69,6 +69,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
   const audioFileUriRef = useRef(null);
   const prepareIdRef = useRef(0);
   const renderTempoRef = useRef(120);
+  const webAudioReadyRef = useRef(false);
 
   const [voiceSelection, setVoiceSelection] = useState({
     Soprano: true,
@@ -139,27 +140,19 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
     });
   }, [processScore]);
 
-  /* ── Phase 1: Pre-render voice tracks when scoreData or instrument changes ── */
-  /* Audio is always rendered at the current tempo. Tempo changes are handled    */
-  /* separately via reRenderForTempo() called on slider release / preset tap.    */
+  /* ── Phase 1: Prepare note events when scoreData or instrument changes ── */
+  /* Parse notes once, build event list. No audio rendering here — just data.  */
   useEffect(() => {
     if (!scoreData) return;
     let cancelled = false;
 
     AudioPlaybackService.initAudio();
 
-    const doPreRender = async () => {
+    const doPrepare = async () => {
       const myId = ++prepareIdRef.current;
 
       // Stop current playback
-      if (AudioPlaybackService.sound) {
-        try {
-          await AudioPlaybackService.sound.stopAsync();
-          await AudioPlaybackService.sound.unloadAsync();
-        } catch (_) {}
-        AudioPlaybackService.sound = null;
-      }
-      AudioPlaybackService.isPlaying = false;
+      await AudioPlaybackService.stop();
       setIsPlaying(false);
       setIsPaused(false);
 
@@ -167,50 +160,67 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
       try {
         AudioPlaybackService.selectPreset(selectedPresetIndex);
         renderTempoRef.current = tempo;
-        console.log(`🎹 preRender [${myId}]: rendering at ${tempo} BPM...`);
 
-        const result = await AudioPlaybackService.preRenderVoiceTracks(scoreData.notes, tempo);
-
+        // Try Web Audio path first (event-based, instant tempo changes)
+        const evtResult = AudioPlaybackService.prepareNoteEvents(scoreData.notes);
         if (cancelled || myId !== prepareIdRef.current) return;
 
-        if (result) {
-          await doMix(myId);
+        if (evtResult) {
+          // Web Audio path: note events prepared, build timing map
+          AudioPlaybackService._useWebAudio = true;
+          webAudioReadyRef.current = true;
+          const timingMap = AudioPlaybackService.buildTimingMap(tempo);
+          const dur = evtResult.totalBeats * (60 / tempo);
+          setTotalDuration(dur);
+          setPlaybackTime(0);
+          buildCursorInfo(timingMap);
+          console.log(`✅ Web Audio ready [${myId}]: ${dur.toFixed(1)}s, ${evtResult.noteEvents.length} events`);
         } else {
-          await legacyPrepare(myId);
+          // Legacy path: no beatOffset data, use expo-av
+          webAudioReadyRef.current = false;
+          AudioPlaybackService._useWebAudio = false;
+          const result = await AudioPlaybackService.preRenderVoiceTracks(scoreData.notes, tempo);
+          if (cancelled || myId !== prepareIdRef.current) return;
+          if (result) {
+            await doMix(myId);
+          } else {
+            await legacyPrepare(myId);
+          }
         }
       } catch (e) {
-        console.error(`preRender [${myId}] error:`, e);
+        console.error(`prepare [${myId}] error:`, e);
         if (myId === prepareIdRef.current) {
           Alert.alert('Error', 'Failed to prepare audio: ' + e.message);
-          setPreparing(false);
         }
+      } finally {
+        if (myId === prepareIdRef.current) setPreparing(false);
       }
     };
 
-    doPreRender();
+    doPrepare();
 
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [scoreData, selectedPresetIndex]);
 
-  /* ── Phase 2: Quick mix when voice selection changes (no re-render needed) ── */
+  /* ── Phase 2: Voice selection changes ── */
+  /* Web Audio: no re-render needed, voice filtering is at play-time.          */
+  /* Legacy:   re-mix pre-rendered voice buffers.                              */
   useEffect(() => {
     if (!scoreData) return;
-    if (!AudioPlaybackService.hasPreRenderedTracks()) return; // not ready yet
+    if (webAudioReadyRef.current) {
+      // Web Audio path: voice selection is applied at play time, nothing to do
+      // If currently playing, reschedule with new voice selection
+      if (AudioPlaybackService.isPlaying) {
+        AudioPlaybackService.changeTempo(tempo, voiceSelection);
+      }
+      return;
+    }
+    if (!AudioPlaybackService.hasPreRenderedTracks()) return;
 
     let cancelled = false;
     const myId = ++prepareIdRef.current;
 
-    // Stop playback before remixing
-    if (AudioPlaybackService.sound) {
-      try {
-        AudioPlaybackService.sound.stopAsync().catch(() => {});
-        AudioPlaybackService.sound.unloadAsync().catch(() => {});
-      } catch (_) {}
-      AudioPlaybackService.sound = null;
-    }
-    AudioPlaybackService.isPlaying = false;
+    AudioPlaybackService.stop();
     setIsPlaying(false);
     setIsPaused(false);
 
@@ -268,35 +278,36 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
   };
 
   /**
-   * Re-render audio at a new tempo. Called when user releases the tempo
-   * slider or taps a preset button. Stops current playback, re-synthesizes,
-   * re-mixes, and leaves audio ready for the next Play press.
+   * Change tempo — instant for Web Audio, re-render for legacy.
    */
   const reRenderForTempo = async (newTempo) => {
     if (!scoreData) return;
     if (newTempo === renderTempoRef.current) return;
+    renderTempoRef.current = newTempo;
 
-    const myId = ++prepareIdRef.current;
-
-    // Stop current playback
-    if (AudioPlaybackService.sound) {
-      try {
-        await AudioPlaybackService.sound.stopAsync();
-        await AudioPlaybackService.sound.unloadAsync();
-      } catch (_) {}
-      AudioPlaybackService.sound = null;
+    if (webAudioReadyRef.current) {
+      // Web Audio path: instant tempo change (just reschedule events)
+      const result = AudioPlaybackService.changeTempo(newTempo, voiceSelection);
+      if (result) {
+        setTotalDuration(result.totalDuration);
+        buildCursorInfo(result.timingMap);
+        setPlaybackTime(0);
+      }
+      console.log(`✅ Instant tempo change: ${newTempo} BPM`);
+      return;
     }
-    AudioPlaybackService.isPlaying = false;
+
+    // Legacy path: full re-render
+    const myId = ++prepareIdRef.current;
+    await AudioPlaybackService.stop();
     setIsPlaying(false);
     setIsPaused(false);
 
     setPreparing(true);
     try {
-      renderTempoRef.current = newTempo;
       const result = await AudioPlaybackService.preRenderVoiceTracks(scoreData.notes, newTempo);
       if (myId !== prepareIdRef.current) return;
       if (!result) {
-        // Legacy path
         await legacyPrepare(myId);
         return;
       }
@@ -408,15 +419,10 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
 
   /* ── Playback controls ── */
   const handlePlay = async () => {
-    if (preparing) return; // Still building audio
-    if (!audioFileUriRef.current) {
-      console.warn('handlePlay: audioFileUriRef is null');
-      Alert.alert('Not Ready', 'Audio is still preparing. Please wait.');
-      return;
-    }
+    if (preparing) return;
 
     if (isPaused) {
-      await AudioPlaybackService.resume();
+      await AudioPlaybackService.resume(voiceSelection);
       setIsPlaying(true);
       setIsPaused(false);
       return;
@@ -426,18 +432,36 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
     setIsPaused(false);
     setPlaybackTime(0);
 
+    if (webAudioReadyRef.current) {
+      // Web Audio path: schedule all notes, no file needed
+      console.log(`▶️ handlePlay: Web Audio at ${tempo} BPM`);
+      AudioPlaybackService._onPositionUpdate = (timeSec) => setPlaybackTime(timeSec);
+      AudioPlaybackService._onFinished = () => {
+        setIsPlaying(false);
+        setIsPaused(false);
+        setPlaybackTime(totalDuration);
+      };
+      AudioPlaybackService.playWebAudio(tempo, voiceSelection,
+        (timeSec) => setPlaybackTime(timeSec),
+        () => { setIsPlaying(false); setIsPaused(false); setPlaybackTime(totalDuration); }
+      );
+      return;
+    }
+
+    // Legacy path: expo-av file playback
+    if (!audioFileUriRef.current) {
+      console.warn('handlePlay: audioFileUriRef is null');
+      Alert.alert('Not Ready', 'Audio is still preparing. Please wait.');
+      setIsPlaying(false);
+      return;
+    }
     const fileUri = audioFileUriRef.current;
     console.log(`▶️ handlePlay: playing ${fileUri}`);
-
     try {
       await AudioPlaybackService.play(
         fileUri,
         (timeSec) => setPlaybackTime(timeSec),
-        () => {
-          setIsPlaying(false);
-          setIsPaused(false);
-          setPlaybackTime(totalDuration);
-        }
+        () => { setIsPlaying(false); setIsPaused(false); setPlaybackTime(totalDuration); }
       );
     } catch (e) {
       console.error('Play error:', e);
@@ -461,7 +485,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
   const handleSeek = async (timeSec) => {
     const clamped = Math.max(0, Math.min(timeSec, totalDuration));
     setPlaybackTime(clamped);
-    await AudioPlaybackService.seekTo(clamped);
+    await AudioPlaybackService.seekTo(clamped, voiceSelection);
   };
 
   const toggleVoice = (voice) => {
@@ -608,7 +632,15 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
             maximumValue={240}
             step={1}
             value={sliderTempo}
-            onValueChange={(v) => setSliderTempo(Math.round(v))}
+            onValueChange={(v) => {
+              const bpm = Math.round(v);
+              setSliderTempo(bpm);
+              // Web Audio: instant live tempo change while dragging
+              if (webAudioReadyRef.current) {
+                setTempo(bpm);
+                reRenderForTempo(bpm);
+              }
+            }}
             onSlidingComplete={(v) => {
               const bpm = Math.round(v);
               setSliderTempo(bpm);

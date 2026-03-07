@@ -15,6 +15,7 @@ export class AudioPlaybackService {
   static _tempFileUri = null;
   static _soundFontReady = false;
   static _renderTempo = 120;
+  static _noteWaveformCache = new Map();
 
   /* ─── SoundFont loading ─── */
 
@@ -60,6 +61,7 @@ export class AudioPlaybackService {
   static selectPreset(index) {
     if (!this._soundFontReady) return;
     SoundFontService.selectPreset(index);
+    this._noteWaveformCache.clear();
   }
 
   /* ─── Frequency helpers ─── */
@@ -75,14 +77,45 @@ export class AudioPlaybackService {
    * Uses SoundFont samples when available, otherwise falls back to synthesis.
    */
   static generatePianoNote(midiNote, duration = 1.0, velocity = 100) {
-    // Try SoundFont rendering first
-    if (this._soundFontReady) {
-      const sfSample = SoundFontService.renderNote(midiNote, duration, velocity);
-      if (sfSample) return sfSample;
+    const sampleRate = 44100;
+    const neededSamples = Math.floor(sampleRate * duration);
+    const cacheKey = `${midiNote}_${velocity}`;
+    const cached = this._noteWaveformCache.get(cacheKey);
+
+    if (cached && cached.length >= neededSamples) {
+      // Fast path: truncate from cache + anti-click fade
+      const out = new Float32Array(neededSamples);
+      out.set(cached.subarray(0, neededSamples));
+      const fadeSamples = Math.min(Math.floor(sampleRate * 0.003), neededSamples);
+      for (let i = 0; i < fadeSamples; i++) {
+        out[neededSamples - 1 - i] *= i / fadeSamples;
+      }
+      return out;
     }
 
-    // Fallback: waveform synthesis
-    return this._synthesizeNote(midiNote, duration, velocity);
+    // Render at 1.5x duration so cache covers ~33% slower tempos too
+    const renderDuration = duration * 1.5;
+    let fullWaveform;
+    if (this._soundFontReady) {
+      fullWaveform = SoundFontService.renderNote(midiNote, renderDuration, velocity);
+    }
+    if (!fullWaveform) {
+      fullWaveform = this._synthesizeNote(midiNote, renderDuration, velocity);
+    }
+
+    // Cache the longer version
+    if (!cached || fullWaveform.length > cached.length) {
+      this._noteWaveformCache.set(cacheKey, fullWaveform);
+    }
+
+    // Return only the needed portion + anti-click fade
+    const out = new Float32Array(neededSamples);
+    out.set(fullWaveform.subarray(0, Math.min(fullWaveform.length, neededSamples)));
+    const fadeSamples = Math.min(Math.floor(sampleRate * 0.003), neededSamples);
+    for (let i = 0; i < fadeSamples; i++) {
+      out[neededSamples - 1 - i] *= i / fadeSamples;
+    }
+    return out;
   }
 
   /**

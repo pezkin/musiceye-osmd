@@ -17,9 +17,9 @@ import {
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { Feather } from '@expo/vector-icons';
-import { AudiverisService } from '../services/AudiverisService';
 import { ZemskyEmulatorService } from '../services/ZemskyEmulatorService';
 import { OMRSettings } from '../services/OMRSettings';
+import { OMRCacheService } from '../services/OMRCacheService';
 
 const palette = {
   background: '#F9F7F1',
@@ -34,16 +34,7 @@ const palette = {
 };
 
 export const SettingsScreen = ({ onNavigateBack }) => {
-  const [audiverisUrl, setAudiverisUrl] = useState(AudiverisService.getServerUrl());
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState(null);
   const [engine, setEngine] = useState(OMRSettings.getEngine());
-
-  // Preprocessing preview state
-  const [previewOriginal, setPreviewOriginal] = useState(null);
-  const [previewProcessed, setPreviewProcessed] = useState(null);
-  const [previewing, setPreviewing] = useState(false);
-  const [previewError, setPreviewError] = useState(null);
   const [fullscreenImage, setFullscreenImage] = useState(null);
 
   React.useEffect(() => {
@@ -55,90 +46,26 @@ export const SettingsScreen = ({ onNavigateBack }) => {
     setEngine(eng);
   };
 
-  const handleSave = () => {
-    const url = audiverisUrl.trim();
-    if (!url) { Alert.alert('Invalid URL', 'Please enter a server URL'); return; }
-    AudiverisService.setServerUrl(url);
-    Alert.alert('Saved', 'Server URL updated');
-  };
-
-  const handleTest = async () => {
-    setTesting(true);
-    setTestResult(null);
-    AudiverisService.setServerUrl(audiverisUrl.trim());
-    const result = await AudiverisService.checkHealth();
-    setTestResult(result);
-    setTesting(false);
-  };
-
-  const handlePreviewPreprocess = async () => {
-    try {
-      const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!permissionResult.granted) {
-        Alert.alert('Permission Required', 'Permission to access photos is required');
-        return;
-      }
-
-      const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
-        allowsEditing: false,
-        quality: 1,
-      });
-
-      if (result.canceled || !result.assets || result.assets.length === 0) return;
-
-      const asset = result.assets[0];
-      setPreviewOriginal(asset.uri);
-      setPreviewProcessed(null);
-      setPreviewError(null);
-      setPreviewing(true);
-
-      try {
-        const processedDataUri = await AudiverisService.debugPreprocess(asset.uri);
-        setPreviewProcessed(processedDataUri);
-      } catch (e) {
-        setPreviewError(e.message);
-      } finally {
-        setPreviewing(false);
-      }
-    } catch (err) {
-      Alert.alert('Error', 'Failed to pick image: ' + (err.message || err));
-    }
-  };
-
-  const handlePreviewFromCamera = async () => {
-    try {
-      const permissionResult = await ImagePicker.requestCameraPermissionsAsync();
-      if (!permissionResult.granted) {
-        Alert.alert('Permission Required', 'Permission to access camera is required');
-        return;
-      }
-
-      const result = await ImagePicker.launchCameraAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
-        allowsEditing: false,
-        quality: 1,
-      });
-
-      if (result.canceled || !result.assets || result.assets.length === 0) return;
-
-      const asset = result.assets[0];
-      setPreviewOriginal(asset.uri);
-      setPreviewProcessed(null);
-      setPreviewError(null);
-      setPreviewing(true);
-
-      try {
-        const processedDataUri = await AudiverisService.debugPreprocess(asset.uri);
-        setPreviewProcessed(processedDataUri);
-      } catch (e) {
-        setPreviewError(e.message);
-      } finally {
-        setPreviewing(false);
-      }
-    } catch (err) {
-      Alert.alert('Error', 'Failed to take photo: ' + (err.message || err));
-    }
+  const handleClearCache = async () => {
+    Alert.alert(
+      'Clear OMR Cache?',
+      'This will delete all cached OMR scan results. You\'ll need to rescan images, but it will use the latest fixes.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await OMRCacheService.clearAll();
+              Alert.alert('Success', 'OMR cache cleared. Next scan will use updated parser.');
+            } catch (err) {
+              Alert.alert('Error', 'Failed to clear cache: ' + (err.message || err));
+            }
+          }
+        }
+      ]
+    );
   };
 
   return (
@@ -200,24 +127,6 @@ export const SettingsScreen = ({ onNavigateBack }) => {
               </Text>
               <Text style={styles.engineVersion}>arm64 emulator • Native .so runtime</Text>
             </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.engineCard, engine === 'audiveris' && styles.engineCardActive]}
-              onPress={() => selectEngine('audiveris')}
-            >
-              <View style={styles.engineHeader}>
-                <View style={[styles.radioOuter, engine === 'audiveris' && styles.radioOuterActive]}>
-                  {engine === 'audiveris' && <View style={styles.radioInner} />}
-                </View>
-                <Text style={[styles.engineName, engine === 'audiveris' && styles.engineNameActive]}>
-                  Audiveris
-                </Text>
-              </View>
-              <Text style={styles.engineDesc}>
-                Full-featured OMR. Detects notes, dynamics, articulations, repeats, and lyrics.
-              </Text>
-              <Text style={styles.engineVersion}>v5.9.0 • Requires server</Text>
-            </TouchableOpacity>
           </View>
         </View>
 
@@ -231,65 +140,19 @@ export const SettingsScreen = ({ onNavigateBack }) => {
           </Text>
         </View>
 
-        {/* Server Configuration */}
+        {/* Cache Management */}
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
-            <Feather name="server" size={18} color={palette.ink} />
-            <Text style={styles.sectionTitle}>Audiveris Server</Text>
+            <Feather name="trash-2" size={18} color={palette.ink} />
+            <Text style={styles.sectionTitle}>Cache Management</Text>
           </View>
           <Text style={styles.sectionDescription}>
-            Audiveris is a full-featured OMR engine with advanced image preprocessing
-            (perspective correction, deskew, adaptive binarization, noise removal).
+            OMR results are cached to avoid reprocessing. After parser updates, clear the cache to use new fixes.
           </Text>
-
-          <Text style={styles.label}>Server URL</Text>
-          <TextInput
-            style={styles.input}
-            value={audiverisUrl}
-            onChangeText={setAudiverisUrl}
-            placeholder="http://localhost:8082"
-            placeholderTextColor="#B5B0A5"
-            autoCapitalize="none"
-            autoCorrect={false}
-            keyboardType="url"
-          />
-
-          <View style={styles.buttonRow}>
-            <TouchableOpacity style={styles.button} onPress={handleTest} disabled={testing}>
-              {testing ? (
-                <ActivityIndicator size="small" color={palette.ink} />
-              ) : (
-                <Feather name="wifi" size={14} color={palette.ink} />
-              )}
-              <Text style={styles.buttonText}>
-                {testing ? 'Testing...' : 'Test Connection'}
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity style={[styles.button, styles.saveButton]} onPress={handleSave}>
-              <Feather name="save" size={14} color={palette.ink} />
-              <Text style={styles.buttonText}>Save</Text>
-            </TouchableOpacity>
-          </View>
-
-          {testResult && (
-            <View style={[
-              styles.resultBox,
-              testResult.ok ? styles.resultOk : styles.resultFail,
-            ]}>
-              <Feather
-                name={testResult.ok ? 'check-circle' : 'alert-circle'}
-                size={16}
-                color={testResult.ok ? palette.success : palette.danger}
-              />
-              <Text style={[
-                styles.resultText,
-                { color: testResult.ok ? palette.success : palette.danger },
-              ]}>
-                {testResult.message}
-              </Text>
-            </View>
-          )}
+          <TouchableOpacity style={[styles.button, styles.dangerButton]} onPress={handleClearCache}>
+            <Feather name="trash-2" size={14} color="#fff" />
+            <Text style={[styles.buttonText, { color: '#fff' }]}>Clear OMR Cache</Text>
+          </TouchableOpacity>
         </View>
 
         {/* Docker Setup Help */}
@@ -297,17 +160,6 @@ export const SettingsScreen = ({ onNavigateBack }) => {
           <View style={styles.sectionHeader}>
             <Feather name="terminal" size={18} color={palette.ink} />
             <Text style={styles.sectionTitle}>Quick Setup</Text>
-          </View>
-
-          <Text style={styles.sectionDescription}>
-            Run the Audiveris server with Docker:
-          </Text>
-          <View style={styles.codeBlock}>
-            <Text style={styles.codeText} selectable>
-              cd audiveris-server{'\n'}
-              docker build -t audiveris-server .{'\n'}
-              docker run --rm -p 8082:8000 audiveris-server
-            </Text>
           </View>
 
           <Text style={styles.sectionDescription}>
@@ -322,86 +174,8 @@ export const SettingsScreen = ({ onNavigateBack }) => {
           </View>
 
           <Text style={styles.hint}>
-            Audiveris uses Docker on your host. Zemsky Emulator uses a separate Android app running inside the same emulator as NoteScan.
+            Zemsky Emulator uses a separate Android app running in the same emulator as NoteScan. On-Device engine runs entirely on your phone with no external dependencies.
           </Text>
-        </View>
-
-        {/* Preprocessing Preview */}
-        <View style={styles.section}>
-          <View style={styles.sectionHeader}>
-            <Feather name="eye" size={18} color={palette.ink} />
-            <Text style={styles.sectionTitle}>Preview Preprocessing</Text>
-          </View>
-
-          <Text style={styles.sectionDescription}>
-            See how your photo looks after the server preprocesses it.
-            This is exactly what Audiveris receives for recognition.
-          </Text>
-
-          <View style={styles.buttonRow}>
-            <TouchableOpacity
-              style={styles.button}
-              onPress={handlePreviewPreprocess}
-              disabled={previewing}
-            >
-              <Feather name="image" size={14} color={palette.ink} />
-              <Text style={styles.buttonText}>From Photos</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.button}
-              onPress={handlePreviewFromCamera}
-              disabled={previewing}
-            >
-              <Feather name="camera" size={14} color={palette.ink} />
-              <Text style={styles.buttonText}>From Camera</Text>
-            </TouchableOpacity>
-          </View>
-
-          {previewing && (
-            <View style={styles.previewLoading}>
-              <ActivityIndicator size="small" color={palette.accent} />
-              <Text style={styles.previewLoadingText}>Preprocessing image...</Text>
-            </View>
-          )}
-
-          {previewError && (
-            <View style={[styles.resultBox, styles.resultFail, { marginTop: 12 }]}>
-              <Feather name="alert-circle" size={16} color={palette.danger} />
-              <Text style={[styles.resultText, { color: palette.danger }]}>
-                {previewError}
-              </Text>
-            </View>
-          )}
-
-          {previewOriginal && (
-            <View style={styles.previewContainer}>
-              <Text style={styles.previewLabel}>ORIGINAL</Text>
-              <TouchableOpacity onPress={() => setFullscreenImage(previewOriginal)}>
-                <Image
-                  source={{ uri: previewOriginal }}
-                  style={styles.previewImage}
-                  resizeMode="contain"
-                />
-              </TouchableOpacity>
-
-              {previewProcessed && (
-                <>
-                  <Text style={[styles.previewLabel, { marginTop: 12 }]}>AFTER PREPROCESSING</Text>
-                  <TouchableOpacity onPress={() => setFullscreenImage(previewProcessed)}>
-                    <Image
-                      source={{ uri: previewProcessed }}
-                      style={styles.previewImage}
-                      resizeMode="contain"
-                    />
-                  </TouchableOpacity>
-                  <Text style={styles.hint}>
-                    Tap either image to view fullscreen
-                  </Text>
-                </>
-              )}
-            </View>
-          )}
         </View>
 
         <View style={{ height: 40 }} />
@@ -522,6 +296,10 @@ const styles = StyleSheet.create({
   },
   saveButton: {
     backgroundColor: palette.surfaceStrong,
+  },
+  dangerButton: {
+    backgroundColor: palette.danger,
+    borderColor: palette.danger,
   },
   buttonText: {
     fontSize: 12,

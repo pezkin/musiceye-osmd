@@ -9,6 +9,7 @@
  */
 import { File } from 'expo-file-system';
 import { MusicXMLParser } from './MusicXMLParser';
+import { normalizeMusicXmlSoftwareTag } from './MusicXmlBranding';
 
 class ZemskyEmulatorServiceClass {
   _serverUrl = 'http://127.0.0.1:8084';
@@ -174,12 +175,14 @@ class ZemskyEmulatorServiceClass {
 
     report('Parsing MusicXML...');
     const json = await response.json();
-    const musicXml = json.musicxml;
+    
+    const musicXml = normalizeMusicXmlSoftwareTag(json.musicxml);
     if (!musicXml || musicXml.length < 50) {
       throw new Error('Zemsky emulator returned an empty or invalid MusicXML payload');
     }
 
-    const parsed = MusicXMLParser.parse(musicXml);
+    const parsed = MusicXMLParser.parse(musicXml, { strictMusicXml: true });
+    
     report('Processing complete!');
 
     return {
@@ -189,7 +192,7 @@ class ZemskyEmulatorServiceClass {
         ...parsed.metadata,
         source: 'zemsky-emulator',
       },
-      notePositions: json.notePositions || null,
+      notePositions: null,
       processedImageUri: null,
     };
   }

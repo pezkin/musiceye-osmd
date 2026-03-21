@@ -13,6 +13,8 @@ import {
   Modal,
   FlatList,
 } from 'react-native';
+import { File, Paths } from 'expo-file-system/next';
+import * as Sharing from 'expo-sharing';
 import Slider from '@react-native-community/slider';
 import { Feather } from '@expo/vector-icons';
 import { AudioPlaybackService } from '../services/AudioPlaybackService';
@@ -39,6 +41,141 @@ const barPalette = {
   barTextMuted: '#C8C4BA',
   accent: '#E05A2A',
 };
+
+// Temporary debug switch: disable pitch panel to isolate playback behavior.
+const ENABLE_PITCH_VIEW = false;
+
+const DURATION_TO_BEATS = {
+  whole: 4,
+  half: 2,
+  quarter: 1,
+  eighth: 0.5,
+  sixteenth: 0.25,
+  '32nd': 0.125,
+  '64th': 0.0625,
+  dotted_whole: 6,
+  dotted_half: 3,
+  dotted_quarter: 1.5,
+  dotted_eighth: 0.75,
+  dotted_sixteenth: 0.375,
+  dotted_32nd: 0.1875,
+};
+
+function buildPitchTimelineFromScoreData(notes, tempoBpm) {
+  if (!Array.isArray(notes) || !notes.length || !Number.isFinite(tempoBpm) || tempoBpm <= 0) {
+    return [];
+  }
+
+  const spb = 60 / tempoBpm;
+  return notes
+    .filter((n) => n.type === 'note' && Number.isFinite(n.midiNote) && Number.isFinite(n.beatOffset))
+    .map((n) => {
+      const durationBeats = Number.isFinite(n.tiedBeats)
+        ? n.tiedBeats
+        : Number.isFinite(n.durationBeats)
+          ? n.durationBeats
+          : (DURATION_TO_BEATS[n.duration] || 1);
+      return {
+        time: n.beatOffset * spb,
+        endTime: (n.beatOffset + durationBeats) * spb,
+        midiNote: n.midiNote,
+        voice: n.voice,
+      };
+    })
+    .sort((a, b) => a.time - b.time);
+}
+
+function buildRawPlaybackDataFromScoreData(notes) {
+  if (!Array.isArray(notes) || !notes.length) {
+    return { noteEvents: [], timingBeatData: [], totalBeats: 0 };
+  }
+
+  const noteEvents = notes
+    .filter((n) => n.type === 'note' && Number.isFinite(n.midiNote) && Number.isFinite(n.beatOffset))
+    .map((n) => {
+      const durationBeats = Number.isFinite(n.tiedBeats)
+        ? n.tiedBeats
+        : Number.isFinite(n.durationBeats)
+          ? n.durationBeats
+          : (DURATION_TO_BEATS[n.duration] || 1);
+      return {
+        midiNote: n.midiNote,
+        velocity: 100,
+        beatOffset: n.beatOffset,
+        durationBeats,
+        voice: n.voice || 'Soprano',
+        x: n.x || 0,
+        y: n.y || 0,
+        staffIndex: n.staffIndex,
+        systemIndex: n.systemIndex ?? 0,
+      };
+    })
+    .sort((a, b) => a.beatOffset - b.beatOffset);
+
+  const beatMap = new Map();
+  for (const e of noteEvents) {
+    const bo = Math.round(e.beatOffset * 1000) / 1000;
+    if (!beatMap.has(bo)) beatMap.set(bo, []);
+    beatMap.get(bo).push(e);
+  }
+
+  const timingBeatData = [];
+  for (const bo of [...beatMap.keys()].sort((a, b) => a - b)) {
+    const group = beatMap.get(bo);
+    const avgX = group.reduce((s, n) => s + n.x, 0) / group.length;
+    const avgY = group.reduce((s, n) => s + n.y, 0) / group.length;
+    timingBeatData.push({
+      beatOffset: bo,
+      x: avgX,
+      y: avgY,
+      voicePositions: group.map((n) => ({ voice: n.voice, y: n.y, x: n.x })),
+      staffIndex: group[0].staffIndex,
+      systemIndex: group[0].systemIndex,
+      isRest: false,
+    });
+  }
+
+  const rests = notes.filter((n) => n.type === 'rest' && Number.isFinite(n.beatOffset));
+  for (const r of rests) {
+    const bo = Math.round(r.beatOffset * 1000) / 1000;
+    if (beatMap.has(bo)) continue;
+    timingBeatData.push({
+      beatOffset: bo,
+      x: r.x || 0,
+      y: r.y || 0,
+      staffIndex: r.staffIndex,
+      systemIndex: r.systemIndex ?? 0,
+      isRest: true,
+    });
+  }
+  timingBeatData.sort((a, b) => a.beatOffset - b.beatOffset);
+
+  const totalBeats = noteEvents.reduce(
+    (mx, e) => Math.max(mx, e.beatOffset + e.durationBeats),
+    0
+  );
+
+  return { noteEvents, timingBeatData, totalBeats };
+}
+
+function buildPitchTimelineFromRawEvents(noteEvents, tempoBpm) {
+  if (!Array.isArray(noteEvents) || !noteEvents.length || !Number.isFinite(tempoBpm) || tempoBpm <= 0) {
+    return [];
+  }
+  const spb = 60 / tempoBpm;
+  return noteEvents
+    .map((e) => ({
+      time: e.beatOffset * spb,
+      endTime: (e.beatOffset + e.durationBeats) * spb,
+      midiNote: e.midiNote,
+      voice: e.voice,
+    }))
+    .sort((a, b) => a.time - b.time);
+}
+
+function getLiteralPlaybackNotes(scoreData) {
+  return scoreData?.notes || [];
+}
 
 /* ─── Component ─── */
 export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
@@ -72,6 +209,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
   const renderTempoRef = useRef(120);
   const webAudioReadyRef = useRef(false);
   const mixDebounceRef = useRef(null);
+  const rawNoteEventsRef = useRef([]);
 
   const [voiceSelection, setVoiceSelection] = useState({
     Soprano: true,
@@ -82,24 +220,72 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
 
   /* ── Process score via selected OMR engine (with caching) ── */
   const processScore = useCallback(async () => {
-    if (!imageUri) return;
+    if (!imageUri) {
+      setProcessing(false);
+      setScoreError('No image selected');
+      return;
+    }
     setProcessing(true);
     setScoreError(null);
-    const engine = OMRSettings.getEngine();
-    const engineName = engine === 'ondevice'
-      ? 'On-device'
-      : engine === 'zemsky'
-        ? 'Zemsky Emulator'
-        : 'Audiveris';
-    const service = OMRSettings.getService();
-    const timeout = engine === 'audiveris' ? 180000 : 120000;
+    const selectedEngine = OMRSettings.getEngine();
+
+    const ENGINE_LABELS = {
+      audiveris: 'Audiveris',
+      ondevice: 'On-device',
+      zemsky: 'Zemsky Emulator',
+    };
+
+    const ENGINE_TIMEOUTS = {
+      audiveris: 360000,
+      ondevice: 300000,
+      zemsky: 180000,
+    };
+
+    const runEngine = async (engineKey, isFallback = false) => {
+      const engineName = ENGINE_LABELS[engineKey] || engineKey;
+      const timeout = ENGINE_TIMEOUTS[engineKey] || 180000;
+
+      if (isFallback) {
+        setProcessingStage(`Primary engine failed. Trying ${engineName}...`);
+      } else if (engineKey === 'audiveris') {
+        setProcessingStage(`Connecting to ${engineName} server...`);
+      } else {
+        setProcessingStage(`Starting ${engineName} analysis...`);
+      }
+
+      let service;
+      if (engineKey === selectedEngine) {
+        service = OMRSettings.getService();
+      } else if (engineKey === 'ondevice') {
+        const { OnDeviceOMRService } = require('../services/OnDeviceOMRService');
+        service = OnDeviceOMRService;
+      } else if (engineKey === 'zemsky') {
+        const { ZemskyEmulatorService } = require('../services/ZemskyEmulatorService');
+        service = ZemskyEmulatorService;
+      } else {
+        // Default to on-device
+        const { OnDeviceOMRService } = require('../services/OnDeviceOMRService');
+        service = OnDeviceOMRService;
+      }
+
+      const result = await Promise.race([
+        service.processSheet(imageUri, (stage) => setProcessingStage(stage)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error(
+          `${engineName} timed out after ${Math.round(timeout / 1000)}s`
+        )), timeout)),
+      ]);
+
+      console.log(`🎼 ${engineName} result: ${result.notes?.length || 0} notes, source=${result.metadata?.source}`);
+      return { result, engineKey, engineName };
+    };
 
     // ── Check cache first ──
     setProcessingStage('Checking cache...');
     try {
-      const cached = await OMRCacheService.get(imageUri, engine);
+      const cached = await OMRCacheService.get(imageUri, selectedEngine);
       if (cached && cached.notes && cached.notes.length > 0) {
-        console.log(`🗂️ Cache hit — ${cached.notes.length} notes, skipping ${engineName}`);
+        const cachedEngineName = ENGINE_LABELS[selectedEngine] || selectedEngine;
+        console.log(`🗂️ Cache hit — ${cached.notes.length} notes, skipping ${cachedEngineName}`);
         setScoreData(cached);
         setProcessing(false);
         setProcessingStage('');
@@ -110,21 +296,49 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
     }
 
     // ── No cache — run OMR engine ──
-    setProcessingStage(`Connecting to ${engineName}...`);
     try {
-      const result = await Promise.race([
-        service.processSheet(imageUri, (stage) => setProcessingStage(stage)),
-        new Promise((_, rej) => setTimeout(() => rej(new Error(`Processing timeout (${timeout / 1000}s)`)), timeout)),
-      ]);
-      console.log(`🎼 ${engineName} result: ${result.notes?.length || 0} notes, source=${result.metadata?.source}`);
-      if (!result.notes || result.notes.length === 0) {
-        setScoreError(`${engineName} could not detect any notes in this image. Try a clearer or higher-resolution photo.`);
-      } else {
-        setScoreData(result);
-        OMRCacheService.set(imageUri, engine, result).catch(() => {});
+      let run = await runEngine(selectedEngine, false);
+
+      if (!run.result?.notes || run.result.notes.length === 0) {
+        throw new Error(`${run.engineName} could not detect any notes`);
       }
+
+      const detectedTempo = Number(run.result?.metadata?.tempo);
+      if (Number.isFinite(detectedTempo) && detectedTempo >= 40 && detectedTempo <= 240) {
+        setSliderTempo(Math.round(detectedTempo));
+        setTempo(Math.round(detectedTempo));
+      }
+
+      setScoreData(run.result);
+      OMRCacheService.set(imageUri, run.engineKey, run.result).catch(() => {});
     } catch (e) {
-      setScoreError(e?.message || 'Failed to process music sheet');
+      console.warn(`Primary engine (${selectedEngine}) failed:`, e?.message || e);
+
+      const shouldTryFallback = selectedEngine !== 'ondevice';
+      if (shouldTryFallback) {
+        try {
+          const fallback = await runEngine('ondevice', true);
+          if (!fallback.result?.notes || fallback.result.notes.length === 0) {
+            throw new Error('On-device could not detect any notes');
+          }
+
+          const detectedTempo = Number(fallback.result?.metadata?.tempo);
+          if (Number.isFinite(detectedTempo) && detectedTempo >= 40 && detectedTempo <= 240) {
+            setSliderTempo(Math.round(detectedTempo));
+            setTempo(Math.round(detectedTempo));
+          }
+
+          setScoreData(fallback.result);
+          OMRCacheService.set(imageUri, 'ondevice', fallback.result).catch(() => {});
+        } catch (fallbackErr) {
+          setScoreError(
+            `${e?.message || 'Primary engine failed'}\n` +
+            `Fallback also failed: ${fallbackErr?.message || 'Unknown error'}`
+          );
+        }
+      } else {
+        setScoreError(e?.message || 'Failed to process music sheet');
+      }
     } finally {
       setProcessing(false);
       setProcessingStage('');
@@ -166,19 +380,21 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
         AudioPlaybackService.selectPreset(selectedPresetIndex);
         renderTempoRef.current = tempo;
 
-        // Always prepare note events (needed for pitch waveform even on legacy path)
-        AudioPlaybackService.prepareNoteEvents(scoreData.notes);
+        const playbackNotes = getLiteralPlaybackNotes(scoreData);
 
-        // Try Web Audio path first (event-based, instant tempo changes)
-        const evtResult = AudioPlaybackService.isWebAudioAvailable()
-          ? AudioPlaybackService.prepareNoteEvents(scoreData.notes)
-          : null;
+        // Prepare playback note events through the service path.
+        const evtResult = AudioPlaybackService.prepareNoteEvents(playbackNotes);
+        rawNoteEventsRef.current = [];
+        const canUseWebAudio = AudioPlaybackService.isWebAudioAvailable() && !!evtResult;
         if (cancelled || myId !== prepareIdRef.current) return;
 
-        // Build pitch timeline regardless of audio path
-        setPitchTimeline(AudioPlaybackService.buildPitchTimeline(tempo));
+        setPitchTimeline(
+          ENABLE_PITCH_VIEW
+            ? buildPitchTimelineFromRawEvents(rawNoteEventsRef.current, tempo)
+            : []
+        );
 
-        if (evtResult) {
+        if (canUseWebAudio) {
           // Web Audio path: note events prepared, build timing map
           AudioPlaybackService._useWebAudio = true;
           webAudioReadyRef.current = true;
@@ -192,7 +408,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
           // Legacy path: no beatOffset data, use expo-av
           webAudioReadyRef.current = false;
           AudioPlaybackService._useWebAudio = false;
-          const result = await AudioPlaybackService.preRenderVoiceTracks(scoreData.notes, tempo);
+          const result = await AudioPlaybackService.preRenderVoiceTracks(playbackNotes, tempo);
           if (cancelled || myId !== prepareIdRef.current) return;
           if (result) {
             await doMix(myId);
@@ -308,7 +524,11 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
       if (result) {
         setTotalDuration(result.totalDuration);
         buildCursorInfo(result.timingMap);
-        setPitchTimeline(AudioPlaybackService.buildPitchTimeline(newTempo));
+        setPitchTimeline(
+          ENABLE_PITCH_VIEW
+            ? buildPitchTimelineFromRawEvents(rawNoteEventsRef.current, newTempo)
+            : []
+        );
         setPlaybackTime(0);
       }
       console.log(`✅ Instant tempo change: ${newTempo} BPM`);
@@ -323,8 +543,13 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
 
     setPreparing(true);
     try {
-      setPitchTimeline(AudioPlaybackService.buildPitchTimeline(newTempo));
-      const result = await AudioPlaybackService.preRenderVoiceTracks(scoreData.notes, newTempo);
+      setPitchTimeline(
+        ENABLE_PITCH_VIEW
+          ? buildPitchTimelineFromRawEvents(rawNoteEventsRef.current, newTempo)
+          : []
+      );
+      const playbackNotes = getLiteralPlaybackNotes(scoreData);
+      const result = await AudioPlaybackService.preRenderVoiceTracks(playbackNotes, newTempo);
       if (myId !== prepareIdRef.current) return;
       if (!result) {
         await legacyPrepare(myId);
@@ -343,7 +568,8 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
     audioFileUriRef.current = null;
     setPreparing(true);
     try {
-      const filteredNotes = scoreData.notes.filter(
+      const playbackNotes = getLiteralPlaybackNotes(scoreData);
+      const filteredNotes = playbackNotes.filter(
         (n) => n.type === 'rest' || voiceSelection[n.voice]
       );
       const playableCount = filteredNotes.filter((n) => n.type !== 'rest').length;
@@ -583,6 +809,42 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
     setShowInstrumentPicker(false);
   };
 
+  const handleExportMusicXml = async () => {
+    const musicXml = scoreData?.musicXml;
+    if (!musicXml || musicXml.length < 20) {
+      Alert.alert('No MusicXML', 'This scan result does not include exportable MusicXML. Please rescan the score.');
+      return;
+    }
+
+    try {
+      const titleBase = (scoreData?.metadata?.title || 'notescan_score')
+        .replace(/[^a-zA-Z0-9_-]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 50) || 'notescan_score';
+
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const fileName = `${titleBase}_${stamp}.musicxml`;
+      const file = new File(Paths.document, fileName);
+
+      file.write(musicXml);
+
+      const canShare = await Sharing.isAvailableAsync();
+      if (!canShare) {
+        Alert.alert('Exported', `Saved MusicXML to: ${file.uri}`);
+        return;
+      }
+
+      await Sharing.shareAsync(file.uri, {
+        mimeType: 'application/vnd.recordare.musicxml+xml',
+        dialogTitle: 'Export MusicXML',
+        UTI: 'public.xml',
+      });
+    } catch (e) {
+      console.error('MusicXML export failed:', e);
+      Alert.alert('Export failed', e?.message || 'Could not export MusicXML file.');
+    }
+  };
+
   const currentInstrumentName = availablePresets[selectedPresetIndex]?.name || 'Piano';
 
   // Compute current beat position from playback time + tempo
@@ -647,7 +909,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
           onSeek={handleSeek}
           measureBeats={scoreData.metadata?.measureBeats}
           tempo={tempo}
-          pitchTimeline={pitchTimeline}
+          pitchTimeline={ENABLE_PITCH_VIEW ? pitchTimeline : []}
           voiceSelection={voiceSelection}
           debugNotes={scoreData?.notes}
         />
@@ -748,6 +1010,15 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
           >
             <Feather name="activity" size={12} color={barPalette.barTextMuted} />
             <Text style={styles.pillText}>{tempo} BPM</Text>
+          </Pressable>
+
+          {/* Export MusicXML */}
+          <Pressable
+            style={({ pressed }) => [styles.zoomPill, pressed && styles.pressedPill]}
+            onPress={handleExportMusicXml}
+          >
+            <Feather name="download" size={12} color={barPalette.barTextMuted} />
+            <Text style={styles.pillText}>Export XML</Text>
           </Pressable>
 
           {/* Voice toggles: tap = solo, long press = toggle */}

@@ -74,7 +74,7 @@ export function exportToMusicXML({
   // Identification
   xml += `  <identification>\n`;
   xml += `    <encoding>\n`;
-  xml += `      <software>Music Eye OMR</software>\n`;
+  xml += `      <software>Music-eye-zem</software>\n`;
   xml += `      <encoding-date>${new Date().toISOString().split('T')[0]}</encoding-date>\n`;
   xml += `    </encoding>\n`;
   xml += `  </identification>\n`;

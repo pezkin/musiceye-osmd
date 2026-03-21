@@ -42,6 +42,10 @@ const DURATION_BEATS = {
   'dotted_eighth': 0.75, 'dotted_sixteenth': 0.375, 'dotted_32nd': 0.1875,
 };
 
+// If a measure's theoretical duration is much larger than parsed voice content,
+// prefer content length to avoid audible silent gaps.
+const MEASURE_CONTENT_GAP_RATIO = 1.35;
+
 // Voice number → voice name (fallback when staff info is unavailable)
 const VOICE_NAMES = { 1: 'Soprano', 2: 'Alto', 3: 'Tenor', 4: 'Bass' };
 
@@ -51,7 +55,7 @@ const VOICE_NAMES = { 1: 'Soprano', 2: 'Alto', 3: 'Tenor', 4: 'Bass' };
  *                        bass   (staff 2) → Tenor/Bass.
  * For multi-part: uses the global staff index to determine position.
  */
-function staffVoiceToSATB(staffNum, voiceNum, stavesInPart) {
+function staffVoiceToSATB(staffNum, voiceNum, stavesInPart, globalStaffOffset = 0) {
   if (stavesInPart >= 2) {
     // Grand staff (piano, organ, etc.)
     // Staff 1 (treble): voice 1→Soprano, voice 2→Alto
@@ -62,17 +66,96 @@ function staffVoiceToSATB(staffNum, voiceNum, stavesInPart) {
       return voiceNum <= 1 ? 'Tenor' : 'Bass';
     }
   }
-  // Single-staff part: use voice number directly
-  return VOICE_NAMES[voiceNum] || VOICE_NAMES[((voiceNum - 1) % 4) + 1];
+
+  // Single-staff part: infer SATB from GLOBAL staff ordering across parts.
+  // Example from Zemsky output: P1 staff1 + P2 staff1.
+  // P1 should map to upper voices (S/A), P2 to lower voices (T/B).
+  const globalStaffIndex = globalStaffOffset + staffNum - 1;
+  const isUpperInPair = globalStaffIndex % 2 === 0;
+
+  if (isUpperInPair) {
+    return voiceNum <= 1 ? 'Soprano' : 'Alto';
+  }
+  return voiceNum <= 1 ? 'Tenor' : 'Bass';
+}
+
+function assignUpperVoices(group) {
+  if (!group || group.length === 0) return;
+  group.sort((a, b) => (b.midiNote || 0) - (a.midiNote || 0));
+  group[0].voice = 'Soprano';
+  for (let i = 1; i < group.length; i++) group[i].voice = 'Alto';
+}
+
+function assignLowerVoices(group) {
+  if (!group || group.length === 0) return;
+  group.sort((a, b) => (b.midiNote || 0) - (a.midiNote || 0));
+  group[0].voice = 'Tenor';
+  for (let i = 1; i < group.length; i++) group[i].voice = 'Bass';
+}
+
+function recoverChoirSATB(notes, voiceCounts) {
+  const allFourVoices = ['Soprano', 'Alto', 'Tenor', 'Bass'];
+  const emptyVoices = allFourVoices.filter(v => !voiceCounts[v]);
+  if (emptyVoices.length < 2) return false;
+
+  const pitched = notes.filter(n => n.type === 'note' && n.midiNote != null);
+  if (pitched.length < 2) return false;
+
+  const beatGroups = new Map();
+  for (const n of pitched) {
+    const key = (typeof n.beatOffset === 'number' ? n.beatOffset : 0).toFixed(4);
+    if (!beatGroups.has(key)) beatGroups.set(key, []);
+    beatGroups.get(key).push(n);
+  }
+
+  // Prefer part-aware mapping for choir-like XML where each part is single-staff,
+  // voice 1-heavy, and upper/lower lines are separated by part.
+  const partIds = [...new Set(pitched.map(n => n.partIndex).filter(Number.isFinite))].sort((a, b) => a - b);
+  const hasPartSplit = partIds.length >= 2;
+
+  if (hasPartSplit) {
+    const midpoint = (partIds.length - 1) / 2;
+    for (const group of beatGroups.values()) {
+      const byPart = new Map();
+      for (const n of group) {
+        const pk = Number.isFinite(n.partIndex) ? n.partIndex : -1;
+        if (!byPart.has(pk)) byPart.set(pk, []);
+        byPart.get(pk).push(n);
+      }
+
+      for (const [pk, pgroup] of byPart.entries()) {
+        const partPos = partIds.indexOf(pk);
+        const isUpper = partPos >= 0 ? partPos <= midpoint : true;
+        if (isUpper) assignUpperVoices(pgroup);
+        else assignLowerVoices(pgroup);
+      }
+    }
+    return true;
+  }
+
+  // Fallback: no usable part split. Use beat-local pitch split.
+  for (const group of beatGroups.values()) {
+    if (group.length <= 1) continue;
+    const sorted = [...group].sort((a, b) => (b.midiNote || 0) - (a.midiNote || 0));
+    const half = Math.ceil(sorted.length / 2);
+    assignUpperVoices(sorted.slice(0, half));
+    assignLowerVoices(sorted.slice(half));
+  }
+  return true;
 }
 
 export class MusicXMLParser {
   /**
    * Parse a MusicXML string into notes and metadata.
    * @param {string} xml - raw MusicXML string
+   * @param {{ strictMusicXml?: boolean, strictTiming?: boolean, strictVoices?: boolean }} [options]
    * @returns {{ notes: Array, metadata: Object }}
    */
-  static parse(xml) {
+  static parse(xml, options = {}) {
+    // Backward compatibility: strictMusicXml enables strict timing and disables
+    // heuristic voice reassignment so parsed voices remain literal.
+    const strictTiming = !!(options.strictMusicXml || options.strictTiming);
+    const strictVoices = !!(options.strictVoices || options.strictMusicXml);
     const notes = [];
     const metadata = {
       title: '',
@@ -238,7 +321,7 @@ export class MusicXMLParser {
           const staffNum = parseInt(noteXml.match(/<staff>(\d+)<\/staff>/)?.[1] || '1');
           const staffIdx = globalStaffOffset + staffNum - 1;
           const voiceNum = parseInt(noteXml.match(/<voice>(\d+)<\/voice>/)?.[1] || '1');
-          const voiceName = staffVoiceToSATB(staffNum, voiceNum, stavesInPart);
+          const voiceName = staffVoiceToSATB(staffNum, voiceNum, stavesInPart, globalStaffOffset);
           const vKey = getVoiceKey(staffNum, voiceNum);
 
           // Initialize voice position on first encounter
@@ -279,6 +362,7 @@ export class MusicXMLParser {
               dotted,
               voice: voiceName,
               staffIndex: staffIdx,
+              partIndex: partIdx,
               systemIndex,
               measureIndex,
               accidental: null,
@@ -313,6 +397,7 @@ export class MusicXMLParser {
                 dotted,
                 voice: voiceName,
                 staffIndex: staffIdx,
+                partIndex: partIdx,
                 systemIndex,
                 measureIndex,
                 accidental,
@@ -333,21 +418,22 @@ export class MusicXMLParser {
         }
 
         // Advance global beat offset by this measure's duration.
-        // Pickup/anacrusis detection: if the first measure has less content
-        // than the time signature suggests, use the actual content duration
-        // to avoid a large silence gap at the start.
+        // ALWAYS use theoretical beats to keep measure boundaries stable.
+        // The MusicXML divisions and time signature define the true measure structure.
+        // Underfilled content (e.g., only 0.5 beat of notes in a 3-beat measure)
+        // should NOT cause the measure to be shortened — this cascades timing errors.
         const theoreticalBeats = currentTime.beats * (4 / currentTime.beatType);
         const maxVoicePos = voiceBeatPos.size > 0
           ? Math.max(...voiceBeatPos.values())
           : 0;
-        let measureBeats;
-        if (measureIndex === 0 && maxVoicePos > 0 && maxVoicePos < theoreticalBeats) {
-          // Pickup measure — use actual content duration
-          measureBeats = maxVoicePos;
-        } else {
-          // Normal measure — use theoretical, or actual if content overflows
-          measureBeats = Math.max(theoreticalBeats, maxVoicePos);
+        
+        // Use theoretical beats consistently; allow overflow if content exceeds
+        let measureBeats = Math.max(theoreticalBeats, maxVoicePos);
+        
+        if (measureIndex < 3) {
+          console.log(`  M${measureIndex + 1}: theoretical=${theoreticalBeats.toFixed(1)} beats, voiceContent=${maxVoicePos.toFixed(1)} beats → measureBeats=${measureBeats.toFixed(1)}`);
         }
+        
         globalBeatOffset += measureBeats;
       }
 
@@ -384,72 +470,12 @@ export class MusicXMLParser {
       if (n.type === 'note') voiceCounts[n.voice] = (voiceCounts[n.voice] || 0) + 1;
     }
 
-    // Check how many of the 4 SATB voices actually have notes.
-    // Audiveris often puts everything in voice 1 → only Soprano (single staff)
-    // or Soprano + Tenor (grand staff). When ≥2 voices are empty, redistribute
-    // using a hybrid per-beat + quartile approach:
-    //   • Beats with 2+ simultaneous notes: top→S, next→A, next→T, bottom→B
-    //   • Beats with only 1 note: use global quartile fallback
-    const allFourVoices = ['Soprano', 'Alto', 'Tenor', 'Bass'];
-    const emptyVoices = allFourVoices.filter(v => !voiceCounts[v]);
-    if (emptyVoices.length >= 2 && noteCount > 1) {
-      const pitched = notes.filter(n => n.type === 'note' && n.midiNote != null);
-      const total = pitched.length;
-
-      if (total >= 2) {
-        // ── Step 1: Group notes by beatOffset (simultaneous notes) ──
-        const beatGroups = new Map(); // beatOffset → [note, note, ...]
-        for (const n of pitched) {
-          const key = n.beatOffset.toFixed(4); // avoid float key issues
-          if (!beatGroups.has(key)) beatGroups.set(key, []);
-          beatGroups.get(key).push(n);
-        }
-
-        // ── Step 2: Per-beat assignment for chords (2+ notes at same beat) ──
-        const voiceOrder = ['Soprano', 'Alto', 'Tenor', 'Bass'];
-        const singleNotes = []; // notes alone on their beat — handled in step 3
-
-        for (const [, group] of beatGroups) {
-          if (group.length >= 2) {
-            // Sort highest pitch first → assign S, A, T, B top-to-bottom
-            group.sort((a, b) => b.midiNote - a.midiNote);
-            group.forEach((n, i) => {
-              n.voice = voiceOrder[Math.min(i, 3)];
-            });
-          } else {
-            singleNotes.push(group[0]);
-          }
-        }
-
-        // ── Step 3: Quartile fallback for single-note beats ──
-        if (singleNotes.length > 0) {
-          // Use all pitched notes to compute quartile boundaries (not just singles)
-          const sortedAll = [...pitched].sort((a, b) => a.midiNote - b.midiNote);
-          const q1 = sortedAll[Math.floor(sortedAll.length * 0.25)].midiNote;
-          const q2 = sortedAll[Math.floor(sortedAll.length * 0.50)].midiNote;
-          const q3 = sortedAll[Math.floor(sortedAll.length * 0.75)].midiNote;
-
-          for (const n of singleNotes) {
-            if (n.midiNote < q1)       n.voice = 'Bass';
-            else if (n.midiNote < q2)  n.voice = 'Tenor';
-            else if (n.midiNote < q3)  n.voice = 'Alto';
-            else                       n.voice = 'Soprano';
-          }
-        }
-
-        const chordBeats = [...beatGroups.values()].filter(g => g.length >= 2).length;
-        console.log(`🎤 Hybrid SATB: ${chordBeats} chord beats (per-beat), ${singleNotes.length} single notes (quartile) across ${total} total`);
-      } else {
-        // Only 1 pitched note — assign Soprano
-        pitched[0].voice = 'Soprano';
-      }
-
-      // Recount from scratch
+    if (!strictVoices && noteCount > 1 && recoverChoirSATB(notes, voiceCounts)) {
       for (const k of Object.keys(voiceCounts)) delete voiceCounts[k];
       for (const n of notes) {
         if (n.type === 'note') voiceCounts[n.voice] = (voiceCounts[n.voice] || 0) + 1;
       }
-      console.log(`🎤 After redistribution:`, JSON.stringify(voiceCounts));
+      console.log(`🎤 Choir SATB recovery: ${JSON.stringify(voiceCounts)}`);
     }
 
     metadata.voiceCounts = voiceCounts;
@@ -512,9 +538,24 @@ export class MusicXMLParser {
       }
     }
 
-    // Extract tempo from <sound tempo="..."/> (first occurrence = original tempo)
-    const tempoMatch = xml.match(/<sound[^>]*\btempo="([\d.]+)"/);
-    metadata.tempo = tempoMatch ? Math.round(parseFloat(tempoMatch[1])) : null;
+    // Extract tempo from <sound tempo="..."/> (LAST occurrence = most recent/correct tempo)
+    // Skip the obvious wrong ones: if tempo is < 20 (unrealistic for playback), assume OMR miscalibration
+    const tempoMatches = [...xml.matchAll(/<sound[^>]*\btempo="([\d.]+)"/g)];
+    let selectedTempo = null;
+    if (tempoMatches.length > 0) {
+      // Use the last occurrence, but skip if it looks wrong (e.g., 8 BPM)
+      selectedTempo = parseFloat(tempoMatches[tempoMatches.length - 1][1]);
+      // If last is unrealistic, try second-to-last
+      if (selectedTempo < 20 && tempoMatches.length > 1) {
+        selectedTempo = parseFloat(tempoMatches[tempoMatches.length - 2][1]);
+      }
+      // If still unrealistic, reject it (OMR calibration error like Audiveris tempo=8)
+      if (selectedTempo < 20) {
+        selectedTempo = null;
+      }
+    }
+    // Default to 120 BPM if no valid tempo found
+    metadata.tempo = selectedTempo ? Math.round(selectedTempo) : 120;
 
     console.log(
       `✅ Parsed MusicXML: ${noteCount} notes, ${restCount} rests, ` +

@@ -1,6 +1,6 @@
 # Music Eye — Agent Handoff Document
 
-> Last updated: March 11, 2026
+> Last updated: March 21, 2026
 > Purpose: Complete project context for any new agent/codespace picking up this work.
 
 ---
@@ -11,7 +11,7 @@
 
 The app has **two OMR engines**:
 - **On-Device Engine** (default) — Pure JavaScript, Zemsky-inspired rule-based OMR. No server needed. Runs entirely on the phone.
-- **Audiveris Engine** — Server-based, uses a Docker container running Audiveris 5.9 with FastAPI. More accurate but requires a running server.
+- **Zemsky Emulator** — Uses the native Zemsky .so library via Android emulator harness. Requires the ZemskyHarness app running in the same emulator.
 
 The user's goal is to **commercialize this app** and compete with David Zemsky's "Sheet Music Scanner" and PlayScore.
 
@@ -27,11 +27,6 @@ The user's goal is to **commercialize this app** and compete with David Zemsky's
 │   ├── SheetMusicScanner.sf2         # SoundFont for playback
 │   └── zemsky-reverse-engineering.md # Full reverse-engineering of Zemsky's libsource-lib.so
 │
-├── audiveris-server/                 # Audiveris OMR server (Docker)
-│   ├── Dockerfile                    # Java 21 + Audiveris 5.9 + Python + xvfb
-│   ├── server.py                     # FastAPI wrapper — /process endpoint
-│   └── preprocess.py                 # Two-stage staff-aware image preprocessing
-│
 └── NoteScan/                         # React Native app (Expo SDK 54)
     ├── App.js                        # Entry point — screen navigation + OMRSettings.load()
     ├── package.json                  # Expo 54, RN 0.81.5, expo-file-system 19
@@ -41,11 +36,11 @@ The user's goal is to **commercialize this app** and compete with David Zemsky's
         ├── screens/
         │   ├── HomeScreen.js         # Main menu, engine status indicator, tap to toggle engine
         │   ├── PlaybackScreen.js     # Score viewer + audio playback + transport controls
-        │   └── SettingsScreen.js     # Engine picker (On-Device / Audiveris) + server URL config
+        │   └── SettingsScreen.js     # Engine picker (On-Device / Zemsky Emulator) + cache management
         ├── services/
         │   ├── OMRSettings.js        # Engine switcher — persists choice via AsyncStorage
         │   ├── OnDeviceOMRService.js # On-device engine wrapper (PNG+JPEG decode, processSheet)
-        │   ├── AudiverisService.js   # Server-based engine (upload image, parse response)
+        │   ├── ZemskyEmulatorService.js # Emulator harness (HTTP bridge to native .so)
         │   ├── MusicXMLParser.js     # Parses MusicXML string → note objects for playback
         │   ├── AudioPlaybackService.js # WAV synthesis using SoundFont samples
         │   ├── SoundFontService.js   # SF2 file parser
@@ -116,7 +111,7 @@ Output: { musicxml: string, notes: Array, metadata: Object }
 ## 4. Service Interface (both engines implement this)
 
 ```javascript
-// Both OnDeviceOMRService and AudiverisService implement:
+// Both OnDeviceOMRService and ZemskyEmulatorService implement:
 service.checkHealth()      → { ok: boolean, message: string }
 service.processImage(uri, onProgress) → { musicXml, notes, metadata, notePositions, processedImageUri }
 service.processSheet(uri, onProgress) → { notes, staves, measures, processedImageUri, metadata }
@@ -150,26 +145,7 @@ This was necessary because camera images are JPEG but there's no Canvas API in R
 
 ---
 
-## 6. Audiveris Server
-
-Docker-based, runs on port 8082. **Not required for on-device engine.**
-
-```bash
-cd audiveris-server
-docker build -t audiveris-server .
-docker run --rm -p 8082:8000 audiveris-server
-```
-
-### Key modifications made to improve detection:
-- `server.py`: Added `poorInputMode=true`, `smallHeads=true`, `smallBeams=true`; widened interline range 8-40
-- `preprocess.py`: Removed destructive morphological open in `_close_gaps()`; lowered Sauvola k 0.15→0.10; reduced noise threshold 10→6
-
-### AGPL-3.0 Warning
-Audiveris is AGPL-licensed. If commercializing the app, the on-device engine avoids this licensing issue entirely.
-
----
-
-## 7. Key Dependencies (NoteScan/package.json)
+## 6. Key Dependencies (NoteScan/package.json)
 
 | Package | Version | Purpose |
 |---------|---------|---------|
@@ -185,7 +161,7 @@ Audiveris is AGPL-licensed. If commercializing the app, the on-device engine avo
 
 ---
 
-## 8. Data Flow
+## 7. Data Flow
 
 ```
 User taps "Scan from Camera/Photos"
@@ -210,7 +186,7 @@ User taps "Scan from Camera/Photos"
 
 ---
 
-## 9. Current Status & Known Issues
+## 8. Current Status & Known Issues
 
 ### What Works
 - [x] Dual engine architecture (on-device + Audiveris)
@@ -242,7 +218,7 @@ User taps "Scan from Camera/Photos"
 
 ---
 
-## 10. Gap Analysis: Our Engine vs Zemsky's Sheet Music Scanner (~50% parity)
+## 9. Gap Analysis: Our Engine vs Zemsky's Sheet Music Scanner (~50% parity)
 
 ### What We Match Zemsky On
 | Pipeline Stage | Zemsky (C++) | Our Engine (JS) | Status |
@@ -297,7 +273,7 @@ User taps "Scan from Camera/Photos"
 
 ---
 
-## 11. Reference: Zemsky Reverse Engineering
+## 10. Reference: Zemsky Reverse Engineering
 
 `ASSETS/zemsky-reverse-engineering.md` contains a complete analysis of David Zemsky's `libsource-lib.so` (3.3MB arm64 binary from Sheet Music Scanner app). This was the blueprint for our on-device engine. Key sections:
 
@@ -313,7 +289,7 @@ Our implementation follows this pipeline closely but is written in JavaScript in
 
 ---
 
-## 12. File-by-File Quick Reference
+## 11. File-by-File Quick Reference
 
 | File | Lines (approx) | What It Does |
 |------|----------------|-------------|
@@ -323,11 +299,11 @@ Our implementation follows this pipeline closely but is written in JavaScript in
 | `SettingsScreen.js` | 600+ | Engine radio cards, Audiveris URL config, preview preprocessing |
 | `OMRSettings.js` | 60 | Engine switcher singleton, AsyncStorage persistence |
 | `OnDeviceOMRService.js` | 650+ | Service wrapper: File.bytes(), PNG/JPEG decode, processSheet() |
-| `AudiverisService.js` | 670 | Server upload, response parsing, .omr position matching |
 | `MusicXMLParser.js` | ~400 | Parse MusicXML → {notes, metadata} |
 | `AudioPlaybackService.js` | ~500 | WAV synthesis from SoundFont samples |
 | `SoundFontService.js` | ~300 | SF2 binary parser |
 | `OMRCacheService.js` | ~100 | Hash-based OMR result caching |
+| `ZemskyEmulatorService.js` | ~400 | Emulator HTTP bridge to native .so |
 | `omr/ImageUtils.js` | ~500 | Binarize, RLE, CC, morphology, scale |
 | `omr/StaffDetector.js` | ~300 | Staff line detection + grouping |
 | `omr/StaffRemover.js` | ~100 | Staff erasure preserving symbols |
@@ -335,5 +311,3 @@ Our implementation follows this pipeline closely but is written in JavaScript in
 | `omr/DurationAssigner.js` | ~250 | Duration, pitch, voice assignment |
 | `omr/MusicXMLExporter.js` | ~300 | MusicXML 4.0 generation |
 | `omr/OnDeviceOMR.js` | ~250 | Pipeline orchestrator |
-| `audiveris-server/server.py` | ~500 | FastAPI + Audiveris CLI wrapper |
-| `audiveris-server/preprocess.py` | ~1300 | Staff-aware image preprocessing |

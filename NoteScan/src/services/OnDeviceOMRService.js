@@ -73,7 +73,7 @@ class OnDeviceOMRServiceClass {
     let metadata = result.metadata;
 
     try {
-      const parsed = MusicXMLParser.parse(result.musicxml);
+      const parsed = MusicXMLParser.parse(result.musicxml, { strictMusicXml: true });
       if (parsed.notes.length > 0) {
         parsedNotes = parsed.notes;
         metadata = { ...metadata, ...parsed.metadata };
@@ -101,7 +101,7 @@ class OnDeviceOMRServiceClass {
    * This mirrors AudiverisService.processSheet().
    */
   async processSheet(imageUri, onProgress) {
-    const { notes, metadata } = await this.processImage(imageUri, onProgress);
+    const { notes, metadata, musicXml } = await this.processImage(imageUri, onProgress);
 
     const imageWidth = metadata.imageWidth || 1400;
     const imageHeight = metadata.imageHeight || 1000;
@@ -176,6 +176,7 @@ class OnDeviceOMRServiceClass {
     const totalRests = notes.filter(n => n.type === 'rest').length;
 
     return {
+      musicXml: musicXml || '',
       notes: allEvents,
       staves: metadata.staves || 2,
       measures: [],

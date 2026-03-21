@@ -265,18 +265,45 @@ export class AudioPlaybackService {
     const hasBeatOffset = notes.some(n => typeof n.beatOffset === 'number' && Number.isFinite(n.beatOffset));
     if (!hasBeatOffset) return null;
 
-    const realNotes = notes.filter(n => n.type !== 'rest' && n.midiNote != null);
-    const noteEvents = realNotes.map(n => ({
-      midiNote: n.midiNote,
-      velocity: 100,
-      beatOffset: Math.round(n.beatOffset * 1000) / 1000,
-      durationBeats: getBeats(n),
-      voice: n.voice || 'Soprano',
-      x: n.x || 0,
-      y: n.y || 0,
-      staffIndex: n.staffIndex,
-      systemIndex: n.systemIndex ?? 0,
-    }));
+    // Calculate total beats first so we can synthesize x positions
+    const realNotes = notes.filter(n => n.type !== 'note' || n.midiNote != null);
+    let totalBeats = 0;
+    for (const n of realNotes) {
+      if (n.type === 'note' && typeof n.beatOffset === 'number') {
+        const dur = getBeats(n);
+        const endBeat = n.beatOffset + dur;
+        totalBeats = Math.max(totalBeats, endBeat);
+      }
+    }
+    if (totalBeats === 0) totalBeats = 1; // avoid division by zero
+    
+    const noteFormatted = realNotes.map(n => {
+      const x = n.x || 0; // Use OCR x if available, else 0 (will be synthesized below)
+      const y = n.y || 0;
+      return {
+        midiNote: n.midiNote,
+        velocity: 100,
+        beatOffset: Math.round(n.beatOffset * 1000) / 1000,
+        durationBeats: getBeats(n),
+        voice: n.voice || 'Soprano',
+        x,
+        y,
+        staffIndex: n.staffIndex,
+        systemIndex: n.systemIndex ?? 0,
+      };
+    });
+
+    // Synthesize x positions from beatOffset if not set
+    // This maps musical time (beats) to horizontal screen position
+    // totalBeats maps to max x (assume ~1200px for landscape sheet music)
+    const SYNTHESIZED_WIDTH = 1200;
+    const noteEvents = noteFormatted.map(n => {
+      const synthX = (n.beatOffset / totalBeats) * SYNTHESIZED_WIDTH;
+      return {
+        ...n,
+        x: n.x > 0 ? n.x : synthX, // Use OCR x if available, else synthesized
+      };
+    });
 
     // Build beat-based timing map (beat positions → coordinates)
     const beatMap = new Map();
@@ -309,9 +336,10 @@ export class AudioPlaybackService {
     for (const r of rests) {
       const rbo = Math.round(r.beatOffset * 1000) / 1000;
       if (!beatMap.has(rbo)) {
+        const synthX = (rbo / totalBeats) * SYNTHESIZED_WIDTH;
         timingBeatData.push({
           beatOffset: rbo,
-          x: r.x || 0,
+          x: r.x > 0 ? r.x : synthX,
           y: r.y || 0,
           staffIndex: r.staffIndex,
           systemIndex: r.systemIndex ?? 0,
@@ -321,15 +349,6 @@ export class AudioPlaybackService {
     }
     timingBeatData.sort((a, b) => a.beatOffset - b.beatOffset);
 
-    // Total beats
-    let totalBeats = 0;
-    if (beatPositions.length > 0) {
-      const lastBo = beatPositions[beatPositions.length - 1];
-      const lastGroup = beatMap.get(lastBo);
-      const maxDur = Math.max(...lastGroup.map(e => e.durationBeats));
-      totalBeats = lastBo + maxDur;
-    }
-
     this._noteEvents = noteEvents;
     this._timingBeatData = timingBeatData;
     this._totalBeats = totalBeats;
@@ -337,7 +356,7 @@ export class AudioPlaybackService {
     // Pre-generate all waveforms so play/tempo-change is instant
     this._precacheWaveforms();
 
-    console.log(`🎵 Prepared ${noteEvents.length} note events, ${totalBeats.toFixed(1)} total beats`);
+    console.log(`🎵 Prepared ${noteEvents.length} note events, ${totalBeats.toFixed(1)} total beats, synthesized x from beatOffset`);
     return { noteEvents, timingBeatData, totalBeats };
   }
 

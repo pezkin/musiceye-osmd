@@ -48,9 +48,7 @@ export const HomeScreen = ({ onNavigate, onPickFromGallery, onPickFromCamera }) 
   const toggleEngine = async () => {
     const next = engine === 'ondevice'
       ? 'zemsky'
-      : engine === 'zemsky'
-        ? 'audiveris'
-        : 'ondevice';
+      : 'ondevice';
     await OMRSettings.setEngine(next);
     setEngine(next);
     if (next !== 'ondevice') {
@@ -62,9 +60,7 @@ export const HomeScreen = ({ onNavigate, onPickFromGallery, onPickFromCamera }) 
 
   const statusLabel = engine === 'ondevice'
     ? 'On-device engine'
-    : engine === 'zemsky'
-      ? (serverStatus === null ? 'Checking Zemsky emulator...' : serverStatus ? 'Zemsky emulator connected' : 'Zemsky emulator unreachable')
-      : (serverStatus === null ? 'Checking Audiveris server...' : serverStatus ? 'Audiveris server connected' : 'Audiveris server unreachable');
+    : (serverStatus === null ? 'Checking Zemsky emulator...' : serverStatus ? 'Zemsky emulator connected' : 'Zemsky emulator unreachable');
 
   return (
     <View style={styles.container}>

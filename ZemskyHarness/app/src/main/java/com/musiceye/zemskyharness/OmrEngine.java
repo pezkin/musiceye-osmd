@@ -238,7 +238,7 @@ public class OmrEngine {
                 Log.d(TAG, "exportToMusicXml: outFile=" + outFile.getAbsolutePath());
                 int exportOk = 0;
                 int[] voiceFilters = new int[] { -1, 0, 1 };
-                int[] divisionsCandidates = new int[] { 4, 1 };
+                int[] divisionsCandidates = new int[] { 2, 4, 1 };
 
                 for (int divisions : divisionsCandidates) {
                     if (exportOk != 0) break;
@@ -248,8 +248,9 @@ public class OmrEngine {
                             sessionPtr,
                             null,
                             "Scanned Score",
-                            "120",
-                            4,
+                            "Piano",
+                            1,
+                            0,
                             4,
                             divisions,
                             voiceFilter
@@ -465,4 +466,5 @@ public class OmrEngine {
         }
         Log.d(TAG, "  Models: all present");
     }
+
 }

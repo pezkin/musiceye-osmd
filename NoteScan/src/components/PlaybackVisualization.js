@@ -11,6 +11,7 @@ import {
 
 const ACCENT = '#E05A2A';
 const ACCENT_LIGHT = 'rgba(224, 90, 42, 0.18)';
+const CURSOR_WIDTH = 3.5; // Thicker, more visible than 2.5
 
 const CURSOR_COLORS = [
   { key: 'orange', color: '#E05A2A', highlight: 'rgba(224, 90, 42, 0.12)' },
@@ -167,6 +168,23 @@ export const PlaybackVisualization = ({
   const cursorImageX = sysR.min + activeRatio * sysR.range;
   const cursorX = cursorImageX * zoomScale;
   const clampedCursorX = Math.max(0, Math.min(cursorX, renderWidth - 3));
+
+  if (showCursor && (currentTime === 0 || activeIndex === 0 || activeIndex % 10 === 0)) {
+    console.log('🔴 CURSOR DEBUG:', {
+      currentTime,
+      activeIndex,
+      positions_length: positions.length,
+      activeRatio: activeRatio.toFixed(3),
+      systemIndex: activeSystemIndex,
+      sysR: { min: sysR.min.toFixed(0), max: sysR.max.toFixed(0), range: sysR.range.toFixed(0) },
+      cursorImageX: cursorImageX.toFixed(0),
+      zoomScale: zoomScale.toFixed(3),
+      cursorX: cursorX.toFixed(0),
+      renderWidth: renderWidth.toFixed(0),
+      clampedCursorX: clampedCursorX.toFixed(0),
+      imageNaturalWidth,
+    });
+  }
 
   let cursorTop = 0;
   let cursorHeight = renderHeight;
@@ -725,15 +743,20 @@ const styles = StyleSheet.create({
   /* ─── Cursor & highlights ─── */
   cursor: {
     position: 'absolute',
-    width: 2.5,
-    borderRadius: 1.5,
-    opacity: 0.85,
+    width: 3.5,
+    borderRadius: 2,
+    opacity: 1,
     zIndex: 10,
+    shadowColor: '#E05A2A',
+    shadowOpacity: 0.6,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 8,
   },
   systemHighlight: {
     position: 'absolute',
     left: 0,
-    backgroundColor: 'rgba(76, 175, 80, 0.06)',
+    backgroundColor: 'rgba(224, 90, 42, 0.12)',
     zIndex: 5,
   },
   noImage: {

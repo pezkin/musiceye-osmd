@@ -12,8 +12,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Crypto from 'expo-crypto';
 import { File } from 'expo-file-system/next';
 
-const CACHE_PREFIX = 'omr_cache_v4_';
-const INDEX_KEY = 'omr_cache_index_v4';
+const CACHE_PREFIX = 'omr_cache_v7_';
+const INDEX_KEY = 'omr_cache_index_v7';
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_ENTRIES = 20; // keep at most 20 cached results
 
@@ -22,17 +22,18 @@ class OMRCacheServiceClass {
 
   /**
    * Generate a SHA-256 hash of the image file contents.
-   * Uses first 64KB + file size as a fast fingerprint.
+   * Uses fast file metadata fingerprint (path tail + size + mtime).
+   * Full byte hashing is too expensive on mobile and can cause UI lag.
    */
   async hashImage(imageUri) {
     try {
       const file = new File(imageUri);
       if (!file.exists) return null;
 
-      // Use the file URI + size as a quick composite key
-      // (reading full file content on mobile is expensive for large images)
       const size = file.size ?? 0;
-      const key = `${imageUri}::${size}`;
+      const mtime = file.modificationTime ?? 0;
+      const tail = String(imageUri || '').split('/').pop() || 'unknown';
+      const key = `${tail}::${size}::${mtime}`;
       const hash = await Crypto.digestStringAsync(
         Crypto.CryptoDigestAlgorithm.SHA256,
         key
